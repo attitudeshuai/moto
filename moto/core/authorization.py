@@ -9,8 +9,16 @@ from typing import (
 from urllib.parse import urlparse
 
 import requests
+from werkzeug.exceptions import HTTPException
 
 from moto import settings
+from moto.core.auth_decision_log import (
+    AuthorizationEvaluation,
+    DenyCategory,
+    get_auth_decision_log,
+    new_request_id,
+)
+from moto.core.exceptions import ServiceException
 from moto.utilities.utils import get_partition
 
 if TYPE_CHECKING:
@@ -19,6 +27,20 @@ if TYPE_CHECKING:
     P = ParamSpec("P")
 
 T = TypeVar("T")
+
+# IAM/S3 raise different hierarchies for the same authorization failures:
+# _RESTError subclasses (HTTPException) for most services and ServiceException
+# subclasses for S3.
+_AUTHORIZATION_ERRORS = (HTTPException, ServiceException)
+
+
+def _error_code(auth_error: Exception) -> str | None:
+    """AWS error code (e.g. AccessDenied) of a raised authorization error."""
+    error_type = getattr(auth_error, "error_type", None)
+    if error_type:
+        return error_type
+    code = getattr(auth_error, "code", None)
+    return code if isinstance(code, str) else None
 
 
 class ActionAuthenticatorMixin:
@@ -50,17 +72,101 @@ class ActionAuthenticatorMixin:
             path = parsed_url.path
             if parsed_url.query:
                 path += "?" + parsed_url.query
-            iam_request = iam_request_cls(
-                account_id=self.current_account,  # type: ignore[attr-defined]
-                method=self.method,  # type: ignore[attr-defined]
-                path=path,
-                data=self.data,  # type: ignore[attr-defined]
-                body=self.raw_body,  # type: ignore[attr-defined]
-                headers=self.headers,  # type: ignore[attr-defined]
-                action=self._get_action(),  # type: ignore[attr-defined]
+            action = self._get_action()  # type: ignore[attr-defined]
+            region = getattr(self, "region", None)
+            decision_log = get_auth_decision_log()
+            request_id = new_request_id()
+
+            try:
+                iam_request = iam_request_cls(
+                    account_id=self.current_account,  # type: ignore[attr-defined]
+                    method=self.method,  # type: ignore[attr-defined]
+                    path=path,
+                    data=self.data,  # type: ignore[attr-defined]
+                    body=self.raw_body,  # type: ignore[attr-defined]
+                    headers=self.headers,  # type: ignore[attr-defined]
+                    action=action,
+                )
+            except _AUTHORIZATION_ERRORS as auth_error:
+                # Invalid access key id / security token: the request object
+                # could not be built, so record a minimal deny decision.
+                evaluation = AuthorizationEvaluation(
+                    action=action[0] if isinstance(action, list) else str(action),
+                    resource=resource,
+                )
+                evaluation.deny(
+                    DenyCategory.INVALID_ACCESS_KEY,
+                    "The provided access key id or security token is invalid",
+                )
+                decision_log.record(
+                    request_id=request_id,
+                    account_id=self.current_account,  # type: ignore[attr-defined]
+                    region=region,
+                    service=getattr(self, "service_name", None),
+                    evaluation=evaluation,
+                    error_code=_error_code(auth_error),
+                )
+                raise
+
+            try:
+                iam_request.check_signature()
+            except _AUTHORIZATION_ERRORS as auth_error:
+                decision_log.record(
+                    request_id=request_id,
+                    account_id=self.current_account,  # type: ignore[attr-defined]
+                    region=region,
+                    service=iam_request._service,
+                    evaluation=iam_request.evaluation,  # type: ignore[arg-type]
+                    error_code=_error_code(auth_error),
+                )
+                raise
+
+            # Failure injection: force a policy-style denial for configured
+            # actions/resources. Uses the same raise path as a real explicit
+            # deny, but the recorded decision is marked as injected.
+            injection_rule = decision_log.find_injection_rule(
+                iam_request._action, resource
             )
-            iam_request.check_signature()
-            iam_request.check_action_permitted(resource)
+            if injection_rule is not None:
+                evaluation = AuthorizationEvaluation(
+                    action=iam_request._action,
+                    resource=resource,
+                    principal=iam_request._access_key.arn,
+                )
+                evaluation.deny(
+                    DenyCategory.INJECTED,
+                    f"Injection rule '{injection_rule.name}' matched the request",
+                    injection_rule=injection_rule,
+                )
+                decision_log.record(
+                    request_id=request_id,
+                    account_id=self.current_account,  # type: ignore[attr-defined]
+                    region=region,
+                    service=iam_request._service,
+                    evaluation=evaluation,
+                    error_code="AccessDenied",
+                )
+                iam_request._raise_access_denied()
+
+            try:
+                evaluation = iam_request.check_action_permitted(resource)
+            except _AUTHORIZATION_ERRORS as auth_error:
+                decision_log.record(
+                    request_id=request_id,
+                    account_id=self.current_account,  # type: ignore[attr-defined]
+                    region=region,
+                    service=iam_request._service,
+                    evaluation=iam_request.evaluation,  # type: ignore[arg-type]
+                    error_code=_error_code(auth_error),
+                )
+                raise
+            decision_log.record(
+                request_id=request_id,
+                account_id=self.current_account,  # type: ignore[attr-defined]
+                region=region,
+                service=iam_request._service,
+                evaluation=evaluation,
+            )
         else:
             ActionAuthenticatorMixin.request_count += 1
 

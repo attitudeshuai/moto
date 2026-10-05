@@ -17,11 +17,130 @@ class MotoAPIResponse(BaseResponse):
         headers: Any,
     ) -> TYPE_RESPONSE:
         if request.method == "POST":
+            from moto.core.auth_decision_log import get_auth_decision_log
+
             from .models import moto_api_backend
 
             moto_api_backend.reset()
+            # Auth decisions and injection rules must not leak across resets
+            get_auth_decision_log().reset_all()
             return 200, {}, json.dumps({"status": "ok"})
         return 400, {}, json.dumps({"Error": "Need to POST to reset Moto"})
+
+    def auth_decisions_response(
+        self,
+        request: Any,
+        full_url: str,
+        headers: Any,
+    ) -> TYPE_RESPONSE:
+        from datetime import datetime
+
+        from moto.core.auth_decision_log import get_auth_decision_log
+
+        if request.method != "GET":
+            return 400, {}, json.dumps({"Error": "Need to GET auth decisions"})
+
+        def _as_bool(value: Any) -> bool | None:
+            if value is None:
+                return None
+            return str(value).lower() in ("1", "true", "yes")
+
+        def _as_datetime(value: Any) -> datetime | None:
+            return datetime.fromisoformat(value) if value else None
+
+        decision_log = get_auth_decision_log()
+        decisions = decision_log.decisions(
+            since=_as_datetime(request.args.get("since")),
+            until=_as_datetime(request.args.get("until")),
+            request_id=request.args.get("request_id"),
+            action=request.args.get("action"),
+            resource=request.args.get("resource"),
+            denied_only=bool(_as_bool(request.args.get("denied_only"))),
+            injected_only=_as_bool(request.args.get("injected_only")),
+        )
+        return (
+            200,
+            {"Content-Type": "application/json"},
+            json.dumps(
+                {
+                    "decisions": [decision.to_dict() for decision in decisions],
+                    "dropped_records": decision_log.dropped_records,
+                    "max_records": decision_log.capacity,
+                }
+            ),
+        )
+
+    def configure_auth_decisions_response(
+        self,
+        request: Any,
+        full_url: str,
+        headers: Any,
+    ) -> TYPE_RESPONSE:
+        from moto.core.auth_decision_log import get_auth_decision_log
+
+        if request.method != "POST":
+            return 400, {}, json.dumps({"Error": "Need to POST configuration"})
+        payload = json.loads(request.data.decode() or "{}")
+        get_auth_decision_log().configure(max_records=payload.get("max_records"))
+        return 200, {}, json.dumps({"status": "ok"})
+
+    def reset_auth_decisions_response(
+        self,
+        request: Any,
+        full_url: str,
+        headers: Any,
+    ) -> TYPE_RESPONSE:
+        from moto.core.auth_decision_log import get_auth_decision_log
+
+        if request.method != "POST":
+            return 400, {}, json.dumps({"Error": "Need to POST to reset"})
+        get_auth_decision_log().reset_all()
+        return 200, {}, json.dumps({"status": "ok"})
+
+    def add_auth_injection_response(
+        self,
+        request: Any,
+        full_url: str,
+        headers: Any,
+    ) -> TYPE_RESPONSE:
+        from moto.core.auth_decision_log import get_auth_decision_log
+
+        if request.method != "POST":
+            return 400, {}, json.dumps({"Error": "Need to POST an injection rule"})
+        payload = json.loads(request.data.decode() or "{}")
+        name = get_auth_decision_log().add_injection_rule(
+            actions=payload.get("actions"),
+            resources=payload.get("resources"),
+            name=payload.get("name"),
+        )
+        return 200, {}, json.dumps({"name": name})
+
+    def remove_auth_injection_response(
+        self,
+        request: Any,
+        full_url: str,
+        headers: Any,
+    ) -> TYPE_RESPONSE:
+        from moto.core.auth_decision_log import get_auth_decision_log
+
+        if request.method != "POST":
+            return 400, {}, json.dumps({"Error": "Need to POST a rule name"})
+        payload = json.loads(request.data.decode() or "{}")
+        get_auth_decision_log().remove_injection_rule(payload.get("name"))
+        return 200, {}, json.dumps({"status": "ok"})
+
+    def clear_auth_injections_response(
+        self,
+        request: Any,
+        full_url: str,
+        headers: Any,
+    ) -> TYPE_RESPONSE:
+        from moto.core.auth_decision_log import get_auth_decision_log
+
+        if request.method != "POST":
+            return 400, {}, json.dumps({"Error": "Need to POST to clear"})
+        get_auth_decision_log().clear_injection_rules()
+        return 200, {}, json.dumps({"status": "ok"})
 
     def reset_auth_response(
         self,

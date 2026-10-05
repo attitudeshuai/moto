@@ -26,6 +26,12 @@ from botocore.auth import S3SigV4Auth, SigV4Auth
 from botocore.awsrequest import AWSRequest
 from botocore.credentials import Credentials
 
+from moto.core.auth_decision_log import (
+    AuthorizationEvaluation,
+    DenyCategory,
+    PolicyDecision,
+    StatementDecision,
+)
 from moto.core.exceptions import (
     AccessDeniedError,
     AuthFailureError,
@@ -247,10 +253,18 @@ class IAMRequestBase(metaclass=ABCMeta):
             )
         except CreateAccessKeyFailure as e:
             self._raise_invalid_access_key(e.reason)
+        # Request-local state of the last authorization decision. A new
+        # IAMRequest is created for every incoming request, so this can never
+        # leak between concurrent requests.
+        self._evaluation: AuthorizationEvaluation | None = None
 
     @property
     def backend(self) -> IAMBackend:
         return iam_backends[self.account_id][get_partition(self._region)]
+
+    @property
+    def evaluation(self) -> AuthorizationEvaluation | None:
+        return self._evaluation
 
     def check_signature(self) -> None:
         original_signature = self._get_string_between(
@@ -258,29 +272,68 @@ class IAMRequestBase(metaclass=ABCMeta):
         )
         calculated_signature = self._calculate_signature()
         if original_signature != calculated_signature:
+            evaluation = AuthorizationEvaluation(
+                action=self._action,
+                resource="*",
+                principal=self._access_key.arn,
+            )
+            evaluation.deny(
+                DenyCategory.SIGNATURE_MISMATCH,
+                "The calculated signature does not match the provided signature",
+            )
+            self._evaluation = evaluation
             self._raise_signature_does_not_match()
 
-    def check_action_permitted(self, resource: str) -> None:
+    def check_action_permitted(self, resource: str) -> AuthorizationEvaluation:
+        evaluation = AuthorizationEvaluation(
+            action=self._action,
+            resource=resource,
+            principal=self._access_key.arn,
+        )
+        self._evaluation = evaluation
+
         if (
             self._action == "sts:GetCallerIdentity"
         ):  # always allowed, even if there's an explicit Deny for it
-            return
+            evaluation.allow("sts:GetCallerIdentity is always allowed")
+            return evaluation
+
         policies = self._access_key.collect_policies()
 
         permitted = False
         for policy in policies:
             iam_policy = IAMPolicy(policy)
-            permission_result = iam_policy.is_action_permitted(self._action, resource)
-            if permission_result == PermissionResult.DENIED:
+            policy_decision = iam_policy.evaluate(self._action, resource)
+            evaluation.add_policy_decision(policy_decision)
+            if policy_decision.result == PermissionResult.DENIED.name:
+                evaluation.deny(
+                    DenyCategory.EXPLICIT_DENY,
+                    "An explicit Deny statement applies to the request",
+                )
                 self._raise_access_denied()
-            elif permission_result == PermissionResult.PERMITTED:
+            elif policy_decision.result == PermissionResult.PERMITTED.name:
                 permitted = True
 
         if self._is_assuming_role_operation(resource):
-            permitted = permitted and self._check_role_trust_relationship(resource)
+            trust_permitted = self._check_role_trust_relationship(resource, evaluation)
+            if not trust_permitted:
+                evaluation.deny(
+                    DenyCategory.TRUST_POLICY_DENY,
+                    "The role trust policy does not permit assuming the role",
+                )
+            permitted = permitted and trust_permitted
+
+        if not permitted and not evaluation.denied:
+            evaluation.deny(
+                DenyCategory.IMPLICIT_DENY,
+                "No policy statement allows the request",
+            )
 
         if not permitted:
             self._raise_access_denied()
+
+        evaluation.allow()
+        return evaluation
 
     def _is_assuming_role_operation(self, resource_arn: str) -> bool:
         if ":role" not in resource_arn.lower():
@@ -294,6 +347,7 @@ class IAMRequestBase(metaclass=ABCMeta):
     def _check_role_trust_relationship(
         self,
         role_arn: str,
+        evaluation: AuthorizationEvaluation,
     ) -> bool:
         target_principal = self._access_key.arn
         incoming_condition_values = format_incoming_conditional_values(self._data)
@@ -301,14 +355,16 @@ class IAMRequestBase(metaclass=ABCMeta):
         role = self.backend.get_role_by_arn(role_arn)
         role_assume_policy = IAMPolicy(role.assume_role_policy_document)
 
-        permission_result = role_assume_policy.is_action_permitted(
+        policy_decision = role_assume_policy.evaluate(
             self._action,
             role_arn,
             target_principal,
             incoming_condition_values,
+            kind="trust",
         )
+        evaluation.add_policy_decision(policy_decision, trust=True)
 
-        return permission_result == PermissionResult.PERMITTED
+        return policy_decision.result == PermissionResult.PERMITTED.name
 
     @abstractmethod
     def _raise_signature_does_not_match(self) -> None:
@@ -424,12 +480,63 @@ class IAMPolicy:
                 if policy_version.is_default
             )
             policy_document = default_version.document
+            # Attached policies are ManagedPolicy instances, which carry an ARN
+            self.policy_id: str | None = getattr(policy, "arn", None)
         elif isinstance(policy, str):
             policy_document = policy
+            self.policy_id = None
         else:
             policy_document = policy["policy_document"]
+            self.policy_id = policy.get("policy_name") or policy.get("PolicyName")
 
         self._policy_json = json.loads(policy_document)
+
+    def evaluate(
+        self,
+        action: str,
+        resource: str = "*",
+        principal: str | None = None,
+        incoming_condition_values: dict[str, str] | None = None,
+        *,
+        kind: str = "identity",
+    ) -> PolicyDecision:
+        """Evaluate the policy and return the outcome with per-statement traces."""
+        statement = self._policy_json["Statement"]
+        statements = statement if isinstance(statement, list) else [statement]
+
+        statement_decisions: list[StatementDecision] = []
+        permitted = False
+        overall = PermissionResult.NEUTRAL
+        for index, policy_statement in enumerate(statements):
+            iam_policy_statement = IAMPolicyStatement(policy_statement)
+            statement_decision = iam_policy_statement.evaluate(
+                action,
+                resource,
+                principal,
+                incoming_condition_values,
+                statement_index=index,
+            )
+            statement_decisions.append(statement_decision)
+            if statement_decision.result == PermissionResult.DENIED.name:
+                # An explicit Deny short-circuits, just like AWS.
+                overall = PermissionResult.DENIED
+                break
+            elif statement_decision.result == PermissionResult.PERMITTED.name:
+                permitted = True
+
+        if overall == PermissionResult.DENIED:
+            result = PermissionResult.DENIED
+        elif permitted:
+            result = PermissionResult.PERMITTED
+        else:
+            result = PermissionResult.NEUTRAL
+
+        return PolicyDecision(
+            policy_id=self.policy_id,
+            kind=kind,
+            statements=tuple(statement_decisions),
+            result=result.name,
+        )
 
     def is_action_permitted(
         self,
@@ -438,36 +545,113 @@ class IAMPolicy:
         principal: str | None = None,
         incoming_condition_values: dict[str, str] | None = None,
     ) -> PermissionResult:
-        permitted = False
-        if isinstance(self._policy_json["Statement"], list):
-            for policy_statement in self._policy_json["Statement"]:
-                iam_policy_statement = IAMPolicyStatement(policy_statement)
-                permission_result = iam_policy_statement.is_action_permitted(
-                    action,
-                    resource,
-                    principal,
-                    incoming_condition_values,
-                )
-                if permission_result == PermissionResult.DENIED:
-                    return permission_result
-                elif permission_result == PermissionResult.PERMITTED:
-                    permitted = True
-        else:  # dict
-            iam_policy_statement = IAMPolicyStatement(self._policy_json["Statement"])
-            return iam_policy_statement.is_action_permitted(
-                action, resource, principal, incoming_condition_values
-            )
-
-        if permitted:
-            return PermissionResult.PERMITTED
-        else:
-            return PermissionResult.NEUTRAL
+        policy_decision = self.evaluate(
+            action, resource, principal, incoming_condition_values
+        )
+        return PermissionResult[policy_decision.result]
 
 
 class IAMPolicyStatement:
     def __init__(self, statement: Any):
         self._statement = statement
 
+    def evaluate(
+        self,
+        action: str,
+        resource: str = "*",
+        principal: str | None = None,
+        incoming_condition_values: dict[str, str] | None = None,
+        *,
+        statement_index: int = 0,
+    ) -> StatementDecision:
+        """Evaluate this statement and describe how far the request matched."""
+        effect = self._statement.get("Effect")
+
+        if "NotAction" in self._statement:
+            action_matched = not self._check_element_matches("NotAction", action)
+        else:  # Action is present
+            action_matched = self._check_element_matches("Action", action)
+
+        if not action_matched:
+            return StatementDecision(
+                index=statement_index,
+                effect=None,
+                action_matched=False,
+                resource_matched=None,
+                matched_resource_pattern=None,
+                conditions_matched=None,
+                principal_matched=None,
+                result=PermissionResult.NEUTRAL.name,
+            )
+
+        if self.is_unknown_principal(self._statement.get("Principal")):
+            return StatementDecision(
+                index=statement_index,
+                effect=effect,
+                action_matched=True,
+                resource_matched=None,
+                matched_resource_pattern=None,
+                conditions_matched=None,
+                principal_matched=None,
+                result=PermissionResult.NEUTRAL.name,
+            )
+
+        if principal and not self._check_principal(principal):
+            return StatementDecision(
+                index=statement_index,
+                effect=effect,
+                action_matched=True,
+                resource_matched=None,
+                matched_resource_pattern=None,
+                conditions_matched=None,
+                principal_matched=False,
+                result=PermissionResult.DENIED.name,
+            )
+
+        if not self._check_conditions(incoming_condition_values):
+            return StatementDecision(
+                index=statement_index,
+                effect=effect,
+                action_matched=True,
+                resource_matched=None,
+                matched_resource_pattern=None,
+                conditions_matched=False,
+                principal_matched=True,
+                result=PermissionResult.DENIED.name,
+            )
+
+        # For trust policies, which doesn't contain resource segments
+        # if the previous checks passed the actions is PERMITTED
+        if not self._statement.get("Resource"):
+            return StatementDecision(
+                index=statement_index,
+                effect=effect,
+                action_matched=True,
+                resource_matched=None,
+                matched_resource_pattern=None,
+                conditions_matched=True,
+                principal_matched=True,
+                result=PermissionResult.PERMITTED.name,
+            )
+
+        same_resource, matched_pattern = self._find_resource_match(resource)
+        if same_resource and self._statement["Effect"] == "Allow":
+            result = PermissionResult.PERMITTED
+        elif same_resource:  # Deny
+            result = PermissionResult.DENIED
+        else:
+            result = PermissionResult.NEUTRAL
+        return StatementDecision(
+            index=statement_index,
+            effect=effect,
+            action_matched=True,
+            resource_matched=same_resource,
+            matched_resource_pattern=matched_pattern,
+            conditions_matched=True,
+            principal_matched=True,
+            result=result.name,
+        )
+
     def is_action_permitted(
         self,
         action: str,
@@ -475,38 +659,9 @@ class IAMPolicyStatement:
         principal: str | None = None,
         incoming_condition_values: dict[str, str] | None = None,
     ) -> PermissionResult:
-        is_action_concerned = False
-
-        if "NotAction" in self._statement:
-            if not self._check_element_matches("NotAction", action):
-                is_action_concerned = True
-        else:  # Action is present
-            if self._check_element_matches("Action", action):
-                is_action_concerned = True
-
-        if is_action_concerned:
-            if self.is_unknown_principal(self._statement.get("Principal")):
-                return PermissionResult.NEUTRAL
-            elif principal and not self._check_principal(principal):
-                return PermissionResult.DENIED
-
-            if not self._check_conditions(incoming_condition_values):
-                return PermissionResult.DENIED
-
-            # For trust policies, which doesn't contain resource segments
-            # if the previous checks passed the actions is PERMITTED
-            if not self._statement.get("Resource"):
-                return PermissionResult.PERMITTED
-
-            same_resource = self._check_element_matches("Resource", resource)
-            if not same_resource:
-                return PermissionResult.NEUTRAL
-            if self._statement["Effect"] == "Allow" and same_resource:
-                return PermissionResult.PERMITTED
-            else:  # Deny
-                return PermissionResult.DENIED
-        else:
-            return PermissionResult.NEUTRAL
+        return PermissionResult[
+            self.evaluate(action, resource, principal, incoming_condition_values).result
+        ]
 
     def is_unknown_principal(self, principal: str | None) -> bool:
         # https://docs.aws.amazon.com/AmazonS3/latest/userguide/s3-bucket-user-policy-specifying-principal-intro.html
@@ -524,13 +679,26 @@ class IAMPolicyStatement:
         return False
 
     def _check_element_matches(self, statement_element: Any, value: str) -> bool:
-        if isinstance(self._statement[statement_element], list):
-            for statement_element_value in self._statement[statement_element]:
+        matched, _ = self._find_matching_element(statement_element, value)
+        return matched
+
+    def _find_matching_element(
+        self, statement_element: str, value: str
+    ) -> tuple[bool, str | None]:
+        """Return whether ``value`` matched and, if so, the matching pattern."""
+        element = self._statement[statement_element]
+        if isinstance(element, list):
+            for statement_element_value in element:
                 if self._match(statement_element_value, value):
-                    return True
-            return False
+                    return True, statement_element_value
+            return False, None
         else:  # string
-            return self._match(self._statement[statement_element], value) is not None
+            if self._match(element, value):
+                return True, element
+            return False, None
+
+    def _find_resource_match(self, resource: str) -> tuple[bool, str | None]:
+        return self._find_matching_element("Resource", resource)
 
     def _check_principal(self, principal: str) -> bool:
         expected_principals = self._statement.get("Principal")
