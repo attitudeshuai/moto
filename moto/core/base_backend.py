@@ -321,6 +321,11 @@ class BackendDict(dict[str, AccountSpecificBackend[SERVICE_BACKEND]]):
             # But this also incurs a significant performance hit
             # backend.__getitem__.cache_clear()
             BackendDict._instances.clear()  # type: ignore[misc]
+        # Clear the cross-service reference subsystem (edges, policies,
+        # warnings, tombstones) so references never leak across mock sessions.
+        from moto.core.references import reset_references
+
+        reset_references()
 
     def __init__(
         self,

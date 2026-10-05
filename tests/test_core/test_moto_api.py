@@ -30,6 +30,181 @@ def test_reset_api() -> None:
 
 
 @mock_aws
+def test_references_api() -> None:
+    if settings.TEST_SERVER_MODE:
+        raise SkipTest("References API is tested against the local mock only")
+
+    from moto.core.references import (
+        ResourceCoordinate,
+        register_reference,
+    )
+
+    client = boto3.client("sqs", region_name="us-east-1")
+    client.create_queue(QueueName="ref-queue")
+
+    source = ResourceCoordinate(
+        service="sns",
+        account_id="123456789012",
+        region="us-east-1",
+        resource_type="subscription",
+        resource_id="sub-1",
+    )
+    target = ResourceCoordinate(
+        service="sqs",
+        account_id="123456789012",
+        region="us-east-1",
+        resource_type="queue",
+        resource_id="ref-queue",
+    )
+    register_reference(source, target, "Subscription")
+
+    response = requests.get(
+        f"{base_url}/moto-api/references",
+        params={
+            "service": "sqs",
+            "account_id": "123456789012",
+            "region": "us-east-1",
+            "resource_type": "queue",
+            "resource_id": "ref-queue",
+        },
+    )
+    assert response.status_code == 200
+    references = response.json()["references"]
+    assert len(references) == 1
+    assert references[0]["source"]["service"] == "sns"
+    assert references[0]["relation"] == "Subscription"
+
+    filtered = requests.get(
+        f"{base_url}/moto-api/references",
+        params={
+            "service": "sqs",
+            "resource_id": "ref-queue",
+            "source_service": "lambda",
+        },
+    ).json()["references"]
+    assert filtered == []
+
+
+@mock_aws
+def test_references_policy_api() -> None:
+    if settings.TEST_SERVER_MODE:
+        raise SkipTest("References API is tested against the local mock only")
+
+    policy_url = f"{base_url}/moto-api/references/policy"
+
+    # nothing configured: empty policy list
+    assert requests.get(policy_url).json()["policies"] == []
+
+    # POST service-scoped deny
+    post_response = requests.post(
+        policy_url,
+        json={"scope": "service", "service": "sqs", "policy": "deny"},
+    )
+    assert post_response.status_code == 201
+
+    # GET resolution for a target
+    resolution = requests.get(
+        policy_url,
+        params={
+            "service": "sqs",
+            "account_id": "123456789012",
+            "region": "us-east-1",
+            "resource_type": "queue",
+            "resource_id": "q",
+        },
+    ).json()
+    assert resolution["policy"] == "deny"
+    assert resolution["source"] == "service"
+
+    # configured list shows the entry
+    policies = requests.get(policy_url).json()["policies"]
+    assert any(
+        entry["policy"] == "deny" and entry["scope"] == ["service", "sqs", ""]
+        for entry in policies
+    )
+
+    # account+service combination outranks service policy
+    requests.post(
+        policy_url,
+        json={
+            "scope": "account",
+            "account_id": "123456789012",
+            "service": "sqs",
+            "policy": "warn",
+        },
+    )
+    resolution = requests.get(
+        policy_url,
+        params={
+            "service": "sqs",
+            "account_id": "123456789012",
+            "region": "us-east-1",
+            "resource_type": "queue",
+            "resource_id": "q",
+        },
+    ).json()
+    assert resolution["policy"] == "warn"
+    assert resolution["source"] == "account+service"
+
+    # DELETE the service policy; resolution falls back to passive (combo deleted
+    # as well above? no -- delete only the service entry)
+    delete_response = requests.request(
+        "DELETE",
+        policy_url,
+        json={"scope": "service", "service": "sqs"},
+    )
+    assert delete_response.json()["deleted"] is True
+
+    # combo entry still active
+    resolution = requests.get(
+        policy_url,
+        params={
+            "service": "sqs",
+            "account_id": "123456789012",
+            "region": "us-east-1",
+            "resource_type": "queue",
+            "resource_id": "q",
+        },
+    ).json()
+    assert resolution["policy"] == "warn"
+
+    delete_response = requests.request(
+        "DELETE",
+        policy_url,
+        json={
+            "scope": "account",
+            "account_id": "123456789012",
+            "service": "sqs",
+        },
+    )
+    assert delete_response.json()["deleted"] is True
+    assert (
+        requests.get(
+            policy_url,
+            params={
+                "service": "sqs",
+                "account_id": "123456789012",
+                "resource_id": "q",
+            },
+        ).json()["policy"]
+        == "passive"
+    )
+
+
+@mock_aws
+def test_references_inconsistencies_and_warnings_api() -> None:
+    if settings.TEST_SERVER_MODE:
+        raise SkipTest("References API is tested against the local mock only")
+
+    inconsistencies_url = f"{base_url}/moto-api/references/inconsistencies"
+    warnings_url = f"{base_url}/moto-api/references/warnings"
+
+    # initially empty
+    assert requests.get(inconsistencies_url).json()["inconsistencies"] == []
+    assert requests.get(warnings_url).json()["warnings"] == []
+
+
+@mock_aws
 def test_data_api() -> None:
     conn = boto3.client("sqs", region_name="us-west-1")
     conn.create_queue(QueueName="queue1")

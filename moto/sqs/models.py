@@ -11,6 +11,11 @@ from urllib.parse import ParseResult
 
 from moto.core.base_backend import BackendDict, BaseBackend
 from moto.core.common_models import BaseModel, CloudFormationModel
+from moto.core.references import (
+    ResourceCoordinate,
+    adapter_registry,
+    guarded_operation,
+)
 from moto.core.resource_tagging import TaggableResourcesMixin, TaggedResource
 from moto.core.utils import (
     camelcase_to_underscores,
@@ -753,9 +758,23 @@ class SQSBackend(BaseBackend, TaggableResourcesMixin):
         return queue
 
     def delete_queue(self, queue_name: str) -> None:
+        # Validate existence first, preserving the original error behavior.
         self.get_queue(queue_name)
 
-        del self.queues[queue_name]
+        target = ResourceCoordinate(
+            service="sqs",
+            account_id=self.account_id,
+            region=self.region_name,
+            resource_type="queue",
+            resource_id=queue_name,
+        )
+
+        def _delete() -> None:
+            del self.queues[queue_name]
+
+        # Policy-aware deletion; without a configured policy this behaves
+        # exactly like the direct deletion above.
+        guarded_operation(target, _delete)
 
     def get_queue_attributes(
         self, queue_name: str, attribute_names: list[str]
@@ -1284,3 +1303,20 @@ class SQSBackend(BaseBackend, TaggableResourcesMixin):
 
 
 sqs_backends = BackendDict(SQSBackend, "sqs")
+
+
+def _sqs_queue_exists(coordinate: ResourceCoordinate) -> bool:
+    if (
+        coordinate.account_id is None
+        or coordinate.region is None
+        or coordinate.resource_id is None
+    ):
+        return False
+    try:
+        backend = sqs_backends[coordinate.account_id][coordinate.region]
+    except Exception:  # noqa: BLE001 - unknown/invalid coordinates -> absent
+        return False
+    return coordinate.resource_id in backend.queues
+
+
+adapter_registry.register_existence_checker("sqs", "queue", _sqs_queue_exists)

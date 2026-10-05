@@ -18,6 +18,13 @@ from cryptography.x509.oid import NameOID
 from moto.core import DEFAULT_ACCOUNT_ID
 from moto.core.base_backend import BackendDict, BaseBackend
 from moto.core.common_models import BaseModel, CloudFormationModel
+from moto.core.references import (
+    ResourceCoordinate,
+    adapter_registry,
+    register_reference,
+    unregister_reference,
+)
+from moto.core.references.adapters import ExtractedEdge
 from moto.core.resource_tagging import TaggableResourcesMixin, TaggedResource
 from moto.core.utils import (
     camelcase_to_underscores,
@@ -52,6 +59,30 @@ from .utils import (
     make_arn_for_subscription,
     make_arn_for_topic,
 )
+
+
+def _subscription_source_coordinate(
+    account_id: str, region_name: str, subscription_arn: str
+) -> ResourceCoordinate:
+    return ResourceCoordinate(
+        service="sns",
+        account_id=account_id,
+        region=region_name,
+        resource_type="subscription",
+        resource_id=subscription_arn,
+    )
+
+
+def _queue_target_coordinate(queue_arn: str) -> ResourceCoordinate:
+    parsed = parse_arn(queue_arn)
+    return ResourceCoordinate(
+        service="sqs",
+        account_id=parsed.account,
+        region=parsed.region,
+        resource_type="queue",
+        resource_id=parsed.resource_id,
+    )
+
 
 DEFAULT_PAGE_SIZE = 100
 MAXIMUM_MESSAGE_LENGTH = 262144  # 256 KiB
@@ -607,6 +638,14 @@ class SNSBackend(BaseBackend, TaggableResourcesMixin):
         for key, value in dict(self.subscriptions).items():
             if value.topic == topic:
                 self.subscriptions.pop(key)
+                if value.protocol == "sqs":
+                    unregister_reference(
+                        _subscription_source_coordinate(
+                            self.account_id, self.region_name, value.arn
+                        ),
+                        _queue_target_coordinate(value.endpoint),
+                        "Subscription",
+                    )
 
     def delete_topic(self, arn: str) -> None:
         with contextlib.suppress(TopicNotFound):
@@ -692,6 +731,14 @@ class SNSBackend(BaseBackend, TaggableResourcesMixin):
 
         subscription.attributes = attributes
         self.subscriptions[subscription.arn] = subscription
+        if protocol == "sqs":
+            register_reference(
+                _subscription_source_coordinate(
+                    self.account_id, self.region_name, subscription.arn
+                ),
+                _queue_target_coordinate(endpoint),
+                "Subscription",
+            )
         return subscription
 
     def _find_subscription(
@@ -707,7 +754,15 @@ class SNSBackend(BaseBackend, TaggableResourcesMixin):
         return None
 
     def unsubscribe(self, subscription_arn: str) -> None:
-        self.subscriptions.pop(subscription_arn, None)
+        subscription = self.subscriptions.pop(subscription_arn, None)
+        if subscription is not None and subscription.protocol == "sqs":
+            unregister_reference(
+                _subscription_source_coordinate(
+                    self.account_id, self.region_name, subscription.arn
+                ),
+                _queue_target_coordinate(subscription.endpoint),
+                "Subscription",
+            )
 
     def list_subscriptions(
         self, next_token: str | None = None
@@ -1347,6 +1402,36 @@ class SNSBackend(BaseBackend, TaggableResourcesMixin):
 
 
 sns_backends = BackendDict(SNSBackend, "sns")
+
+
+def _delete_sns_subscription(coordinate: ResourceCoordinate) -> None:
+    """Deleter adapter: remove the subscription identified by its ARN."""
+    parsed = parse_arn(coordinate.resource_id)
+    backend = sns_backends[parsed.account][parsed.region]
+    backend.unsubscribe(coordinate.resource_id)
+
+
+def _extract_sns_subscription_edges() -> Iterator[ExtractedEdge]:
+    """Extractor adapter: actual SQS edges held by every SNS backend."""
+    for account_id, account_backend in sns_backends.items():
+        for region_name, backend in account_backend.items():
+            for subscription in backend.subscriptions.values():
+                if subscription.protocol != "sqs":
+                    continue
+                yield (
+                    _subscription_source_coordinate(
+                        account_id, region_name, subscription.arn
+                    ),
+                    _queue_target_coordinate(subscription.endpoint),
+                    "Subscription",
+                    {},
+                )
+
+
+adapter_registry.register_deleter("sns", "subscription", _delete_sns_subscription)
+adapter_registry.register_extractor(
+    "sns", "subscription", _extract_sns_subscription_edges
+)
 
 
 DEFAULT_EFFECTIVE_DELIVERY_POLICY = {

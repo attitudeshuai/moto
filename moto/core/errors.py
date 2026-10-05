@@ -28,6 +28,9 @@ COMMON_ERROR_CODES = [
     "InvalidParameterValue",
     "ValidationError",
     "ValidationException",
+    # Generic code raised by the cross-service reference registry; it lives
+    # outside any single service's error model by design.
+    "ReferenceViolation",
 ]
 
 
@@ -96,6 +99,8 @@ class ErrorLookupFactory:
 
 
 def get_exception_service_model(exception: Exception) -> ServiceModel | None:
+    from botocore.exceptions import UnknownServiceError
+
     from moto.core.utils import get_service_model
 
     exception_module = exception.__module__
@@ -103,7 +108,12 @@ def get_exception_service_model(exception: Exception) -> ServiceModel | None:
         return None
     package = exception_module.split(".")[1]
     service_name = utils.service_name_from_moto_package_name(package)
-    service_model = get_service_model(service_name)
+    try:
+        service_model = get_service_model(service_name)
+    except UnknownServiceError:
+        # Some moto packages (e.g. moto.core itself) do not correspond to an
+        # AWS service model and cannot provide error-shape metadata.
+        return None
     return service_model
 
 

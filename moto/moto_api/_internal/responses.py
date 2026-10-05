@@ -405,6 +405,158 @@ class MotoAPIResponse(BaseResponse):
         config = moto_api_backend.get_config()
         return 201, res_headers, json.dumps(config).encode("utf-8")
 
+    # -- cross-service references -------------------------------------------
+
+    def _query_param(self, name: str, default: str | None = None) -> str | None:
+        value = self.querystring.get(name)
+        if not value:
+            return default
+        raw = value[0]
+        return raw.decode("utf-8") if isinstance(raw, bytes) else raw
+
+    def list_references(
+        self,
+        request: Any,
+        full_url: str,
+        headers: Any,
+    ) -> TYPE_RESPONSE:
+        self.setup_class(request, full_url, headers)
+        from moto.core.references import ResourceCoordinate, list_referrers
+
+        target = ResourceCoordinate(
+            service=self._query_param("service") or "",
+            account_id=self._query_param("account_id"),
+            region=self._query_param("region"),
+            resource_type=self._query_param("resource_type"),
+            resource_id=self._query_param("resource_id") or "",
+        )
+        records = list_referrers(
+            target,
+            source_service=self._query_param("source_service"),
+            source_account_id=self._query_param("source_account_id"),
+            source_region=self._query_param("source_region"),
+            relation=self._query_param("relation"),
+        )
+        body = {"references": [record.to_dict() for record in records]}
+        return 200, {"Content-Type": "application/json"}, json.dumps(body)
+
+    def reference_policy(
+        self,
+        request: Any,
+        full_url: str,
+        headers: Any,
+    ) -> TYPE_RESPONSE:
+        # setup_class consumes the request stream; only call it for GET (which
+        # needs the parsed querystring). POST/DELETE read the raw body below.
+        if request.method == "GET":
+            self.setup_class(request, full_url, headers)
+        from moto.core.references import (
+            PolicyValue,
+            delete_account_reference_policy,
+            delete_global_reference_policy,
+            delete_service_reference_policy,
+            policy_book,
+            resolve_reference_policy,
+            set_account_reference_policy,
+            set_global_reference_policy,
+            set_service_reference_policy,
+        )
+        from moto.core.references.coordinates import ResourceCoordinate
+        from moto.core.references.policy import Operation
+
+        json_headers = {"Content-Type": "application/json"}
+
+        if request.method == "POST":
+            body = self._get_body(headers, request)
+            policy = PolicyValue(body["policy"])
+            scope = body.get("scope", "service")
+            if scope == "global":
+                set_global_reference_policy(policy)
+            elif scope == "account":
+                set_account_reference_policy(
+                    body["account_id"], policy, service=body.get("service")
+                )
+            else:
+                set_service_reference_policy(
+                    body["service"],
+                    policy,
+                    resource_type=body.get("resource_type"),
+                )
+            return 201, json_headers, json.dumps({"status": "ok"})
+
+        if request.method == "DELETE":
+            body = self._get_body(headers, request)
+            scope = body.get("scope", "service")
+            if scope == "global":
+                deleted = delete_global_reference_policy()
+            elif scope == "account":
+                deleted = delete_account_reference_policy(
+                    body["account_id"], service=body.get("service")
+                )
+            else:
+                deleted = delete_service_reference_policy(
+                    body["service"], resource_type=body.get("resource_type")
+                )
+            return (
+                200,
+                json_headers,
+                json.dumps({"deleted": deleted}),
+            )
+
+        # GET: resolve for a target, otherwise list all configured policies
+        resource_id = self._query_param("resource_id")
+        if resource_id is not None:
+            target = ResourceCoordinate(
+                service=self._query_param("service") or "",
+                account_id=self._query_param("account_id"),
+                region=self._query_param("region"),
+                resource_type=self._query_param("resource_type"),
+                resource_id=resource_id,
+            )
+            operation_value = self._query_param("operation") or "delete"
+            assert operation_value in ("delete", "replace")
+            operation: Operation = operation_value  # type: ignore[assignment]
+            resolution = resolve_reference_policy(target, operation=operation)
+            return 200, json_headers, json.dumps(resolution.to_dict())
+        return (
+            200,
+            json_headers,
+            json.dumps({"policies": policy_book.list_policies()}),
+        )
+
+    def reference_inconsistencies(
+        self,
+        request: Any,
+        full_url: str,
+        headers: Any,
+    ) -> TYPE_RESPONSE:
+        self.setup_class(request, full_url, headers)
+        from moto.core.references import AuditFilters, run_audit
+
+        findings = run_audit(
+            AuditFilters(
+                type=self._query_param("type"),  # type: ignore[arg-type]
+                service=self._query_param("service"),
+                account_id=self._query_param("account_id"),
+                region=self._query_param("region"),
+            )
+        )
+        body = {"inconsistencies": [finding.to_dict() for finding in findings]}
+        return 200, {"Content-Type": "application/json"}, json.dumps(body)
+
+    def reference_warnings(
+        self,
+        request: Any,
+        full_url: str,
+        headers: Any,
+    ) -> TYPE_RESPONSE:
+        self.setup_class(request, full_url, headers)
+        from moto.core.references import list_warnings
+
+        records = list_warnings()
+        body = {"warnings": [record.to_dict() for record in records]}
+        return 200, {"Content-Type": "application/json"}, json.dumps(body)
+
     def _get_body(self, headers: Any, request: Any) -> Any:
         if isinstance(request, AWSPreparedRequest):
             return json.loads(request.body)  # type: ignore[arg-type]

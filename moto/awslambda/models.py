@@ -29,6 +29,13 @@ from moto.awslambda.policy import Policy
 from moto.core.base_backend import BackendDict, BaseBackend
 from moto.core.common_models import BaseModel, CloudFormationModel
 from moto.core.exceptions import JsonRESTError as RESTError
+from moto.core.references import (
+    ResourceCoordinate,
+    adapter_registry,
+    register_reference,
+    unregister_reference,
+)
+from moto.core.references.adapters import ExtractedEdge
 from moto.core.resource_tagging import TaggableResourcesMixin, TaggedResource
 from moto.core.utils import iso_8601_datetime_with_nanoseconds, unix_time_millis, utcnow
 from moto.dynamodb import dynamodb_backends
@@ -43,6 +50,7 @@ from moto.moto_api._internal import mock_random as random
 from moto.s3.exceptions import MissingBucket, MissingKey
 from moto.s3.models import FakeKey, s3_backends
 from moto.sqs.models import sqs_backends
+from moto.utilities.arns import parse_arn
 from moto.utilities.docker_utilities import DockerModel
 from moto.utilities.utils import (
     ARN_PARTITION_REGEX,
@@ -1303,6 +1311,29 @@ class FunctionUrlConfig:
         self.last_modified = utcnow().strftime("%Y-%m-%dT%H:%M:%S")
 
 
+def _esm_source_coordinate(
+    account_id: str, region_name: str, uuid: str
+) -> ResourceCoordinate:
+    return ResourceCoordinate(
+        service="lambda",
+        account_id=account_id,
+        region=region_name,
+        resource_type="event_source_mapping",
+        resource_id=uuid,
+    )
+
+
+def _sqs_queue_coordinate_from_arn(queue_arn: str) -> ResourceCoordinate:
+    parsed = parse_arn(queue_arn)
+    return ResourceCoordinate(
+        service="sqs",
+        account_id=parsed.account,
+        region=parsed.region,
+        resource_type="queue",
+        resource_id=parsed.resource_id,
+    )
+
+
 class EventSourceMapping(CloudFormationModel):
     def __init__(self, spec: dict[str, Any]):
         # required
@@ -2137,6 +2168,11 @@ class LambdaBackend(BaseBackend, TaggableResourcesMixin):
                 # Set backend function on queue
                 queue.lambda_event_source_mappings[esm.function_arn] = esm
 
+                register_reference(
+                    _esm_source_coordinate(esm.account_id, esm.region, esm.uuid),
+                    _sqs_queue_coordinate_from_arn(esm.event_source_arn),
+                    "EventSourceMapping",
+                )
                 return esm
 
         ddbstream_backend = dynamodbstreams_backends[self.account_id][self.region_name]
@@ -2212,7 +2248,19 @@ class LambdaBackend(BaseBackend, TaggableResourcesMixin):
         return self._event_source_mappings.get(uuid)
 
     def delete_event_source_mapping(self, uuid: str) -> EventSourceMapping | None:
-        return self._event_source_mappings.pop(uuid, None)
+        esm = self._event_source_mappings.pop(uuid, None)
+        if esm is not None and esm._get_service_source_from_arn().startswith("sqs"):
+            unregister_reference(
+                _esm_source_coordinate(esm.account_id, esm.region, esm.uuid),
+                _sqs_queue_coordinate_from_arn(esm.event_source_arn),
+                "EventSourceMapping",
+            )
+            queue = sqs_backends[esm.account_id][esm.region].queues.get(
+                parse_arn(esm.event_source_arn).resource_id
+            )
+            if queue is not None:
+                queue.lambda_event_source_mappings.pop(esm.function_arn, None)
+        return esm
 
     def update_event_source_mapping(
         self, uuid: str, spec: dict[str, Any]
@@ -2681,3 +2729,40 @@ def do_validate_s3() -> bool:
 
 
 lambda_backends = BackendDict(LambdaBackend, "lambda")
+
+
+def _delete_lambda_event_source_mapping(
+    coordinate: ResourceCoordinate,
+) -> None:
+    """Deleter adapter: remove the event source mapping identified by uuid."""
+    if coordinate.account_id is None or coordinate.region is None:
+        return
+    backend = lambda_backends[coordinate.account_id][coordinate.region]
+    backend.delete_event_source_mapping(coordinate.resource_id)
+
+
+def _extract_lambda_event_source_mapping_edges() -> Iterator[ExtractedEdge]:
+    """Extractor adapter: actual SQS edges held by every Lambda backend."""
+    for account_id, account_backend in lambda_backends.items():
+        for region_name, backend in account_backend.items():
+            for esm in backend._event_source_mappings.values():  # noqa: SLF001
+                if not esm._get_service_source_from_arn().startswith("sqs"):
+                    continue
+                yield (
+                    _esm_source_coordinate(account_id, region_name, esm.uuid),
+                    _sqs_queue_coordinate_from_arn(esm.event_source_arn),
+                    "EventSourceMapping",
+                    {},
+                )
+
+
+adapter_registry.register_deleter(
+    "lambda",
+    "event_source_mapping",
+    _delete_lambda_event_source_mapping,
+)
+adapter_registry.register_extractor(
+    "lambda",
+    "event_source_mapping",
+    _extract_lambda_event_source_mapping_edges,
+)

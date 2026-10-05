@@ -19,6 +19,13 @@ from moto import settings
 from moto.core.base_backend import BackendDict, BaseBackend
 from moto.core.common_models import BaseModel, CloudFormationModel
 from moto.core.exceptions import JsonRESTError
+from moto.core.references import (
+    ResourceCoordinate,
+    adapter_registry,
+    register_reference,
+    unregister_reference,
+)
+from moto.core.references.adapters import ExtractedEdge
 from moto.core.resource_tagging import TaggableResourcesMixin, TaggedResource
 from moto.core.utils import (
     iso_8601_datetime_without_milliseconds,
@@ -55,6 +62,42 @@ if TYPE_CHECKING:
 
 # Sentinel to signal the absence of a field for `Exists` pattern matching
 UNDEFINED = object()
+
+
+def _rule_target_coordinate(
+    account_id: str,
+    region_name: str,
+    event_bus_name: str,
+    rule_name: str,
+    target_id: str,
+) -> ResourceCoordinate:
+    # '@' is not an allowed character in AWS rule names, target ids or custom
+    # event bus names, so it safely separates the composite key.
+    return ResourceCoordinate(
+        service="events",
+        account_id=account_id,
+        region=region_name,
+        resource_type="rule_target",
+        resource_id=f"{event_bus_name}@{rule_name}@{target_id}",
+    )
+
+
+def _sqs_queue_coordinate(queue_arn: str) -> ResourceCoordinate:
+    parsed = parse_arn(queue_arn)
+    return ResourceCoordinate(
+        service="sqs",
+        account_id=parsed.account,
+        region=parsed.region,
+        resource_type="queue",
+        resource_id=parsed.resource_id,
+    )
+
+
+def _is_sqs_arn(arn: str) -> bool:
+    try:
+        return parse_arn(arn).service == "sqs"
+    except ValueError:
+        return False
 
 
 def get_secrets_manager_backend(account_id: str, region: str) -> SecretsManagerBackend:
@@ -125,17 +168,63 @@ class Rule(CloudFormationModel):
     def put_targets(self, targets: list[dict[str, Any]]) -> None:
         # Not testing for valid ARNs.
         for target in targets:
-            index = self._check_target_exists(target["Id"])
+            target_id = target["Id"]
+            index = self._check_target_exists(target_id)
+            old_arn = self.targets[index]["Arn"] if index is not None else None
+
+            # Register the new edge BEFORE mutating the model: validation
+            # failures (tombstone, missing target) leave model and registry
+            # untouched.
+            if _is_sqs_arn(target["Arn"]):
+                register_reference(
+                    _rule_target_coordinate(
+                        self.account_id,
+                        self.region_name,
+                        self.event_bus_name,
+                        self.name,
+                        target_id,
+                    ),
+                    _sqs_queue_coordinate(target["Arn"]),
+                    "RuleTarget",
+                )
+
             if index is not None:
                 self.targets[index] = target
             else:
                 self.targets.append(target)
 
+            # Retire the replaced edge after the model commit. The transient
+            # state with both edges present is still a valid set of references.
+            if old_arn is not None and _is_sqs_arn(old_arn):
+                unregister_reference(
+                    _rule_target_coordinate(
+                        self.account_id,
+                        self.region_name,
+                        self.event_bus_name,
+                        self.name,
+                        target_id,
+                    ),
+                    _sqs_queue_coordinate(old_arn),
+                    "RuleTarget",
+                )
+
     def remove_targets(self, ids: list[str]) -> None:
         for target_id in ids:
             index = self._check_target_exists(target_id)
             if index is not None:
-                self.targets.pop(index)
+                old_target = self.targets.pop(index)
+                if _is_sqs_arn(old_target["Arn"]):
+                    unregister_reference(
+                        _rule_target_coordinate(
+                            self.account_id,
+                            self.region_name,
+                            self.event_bus_name,
+                            self.name,
+                            target_id,
+                        ),
+                        _sqs_queue_coordinate(old_target["Arn"]),
+                        "RuleTarget",
+                    )
 
     def send_to_targets(
         self, original_event: EventMessageType, transform_input: bool = True
@@ -1414,7 +1503,7 @@ class EventsBackend(BaseBackend, TaggableResourcesMixin):
             arn = target["Arn"]
 
             if (
-                ":sqs:" in arn
+                _is_sqs_arn(arn)
                 and arn.endswith(".fifo")
                 and not target.get("SqsParameters")
             ):
@@ -1709,6 +1798,21 @@ class EventsBackend(BaseBackend, TaggableResourcesMixin):
             )
         event_bus = self.event_buses.pop(name, None)
         if event_bus:
+            # Rules go away with the bus; unregister their SQS edges.
+            for rule in event_bus.rules.values():
+                for target in rule.targets:
+                    if ":sqs:" in target["Arn"]:
+                        unregister_reference(
+                            _rule_target_coordinate(
+                                event_bus.account_id,
+                                event_bus.region,
+                                event_bus.name,
+                                rule.name,
+                                target["Id"],
+                            ),
+                            _sqs_queue_coordinate(target["Arn"]),
+                            "RuleTarget",
+                        )
             self.tagger.delete_all_tags_for_resource(event_bus.arn)
 
     def list_tags_for_resource(self, arn: str) -> dict[str, list[dict[str, str]]]:
@@ -2144,3 +2248,45 @@ class EventsBackend(BaseBackend, TaggableResourcesMixin):
 
 
 events_backends = BackendDict(EventsBackend, "events")
+
+
+def _delete_events_rule_target(coordinate: ResourceCoordinate) -> None:
+    """Deleter adapter: remove the rule target encoded in the coordinate."""
+    if coordinate.account_id is None or coordinate.region is None:
+        return
+    event_bus_name, rule_name, target_id = coordinate.resource_id.split("@", 2)
+    backend = events_backends[coordinate.account_id][coordinate.region]
+    backend.remove_targets(
+        name=rule_name,
+        event_bus_arn=event_bus_name,
+        ids=[target_id],
+    )
+
+
+def _extract_events_rule_target_edges() -> Iterator[ExtractedEdge]:
+    """Extractor adapter: actual SQS target edges on every Events backend."""
+    for account_id, account_backend in events_backends.items():
+        for region_name, backend in account_backend.items():
+            for event_bus in backend.event_buses.values():
+                for rule in event_bus.rules.values():
+                    for target in rule.targets:
+                        if ":sqs:" not in target["Arn"]:
+                            continue
+                        yield (
+                            _rule_target_coordinate(
+                                account_id,
+                                region_name,
+                                event_bus.name,
+                                rule.name,
+                                target["Id"],
+                            ),
+                            _sqs_queue_coordinate(target["Arn"]),
+                            "RuleTarget",
+                            {},
+                        )
+
+
+adapter_registry.register_deleter("events", "rule_target", _delete_events_rule_target)
+adapter_registry.register_extractor(
+    "events", "rule_target", _extract_events_rule_target_edges
+)
