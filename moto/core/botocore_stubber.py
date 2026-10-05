@@ -9,6 +9,7 @@ from moto.core.base_backend import BackendDict
 from moto.core.common_types import TYPE_RESPONSE
 from moto.core.config import passthrough_service, passthrough_url, service_whitelisted
 from moto.core.exceptions import ServiceNotWhitelisted
+from moto.core.scopes import run_with_scope
 from moto.core.utils import get_equivalent_url_in_aws_domain
 
 
@@ -85,8 +86,12 @@ class BotocoreStubber:
 
                         try:
                             recorder._record_request(request)
-                            status, headers, body = method_to_execute(
-                                request, request.url, request.headers
+                            status, headers, body = run_with_scope(
+                                request.headers,
+                                method_to_execute,
+                                request,
+                                request.url,
+                                request.headers,
                             )
                         except HTTPException as e:
                             status = e.code

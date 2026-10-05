@@ -22,7 +22,7 @@ from io import BytesIO
 from typing import Any, Optional
 
 from moto.cloudwatch.models import MetricDatum
-from moto.core.base_backend import BackendDict, BaseBackend
+from moto.core.base_backend import BackendDict, BaseBackend, backend_lock
 from moto.core.common_models import (
     BaseModel,
     CloudFormationModel,
@@ -3315,9 +3315,31 @@ class S3BackendDict(BackendDict[S3Backend]):
     ):
         super().__init__(backend, service_name, use_boto3_regions, additional_regions)
 
-        # Maps bucket names to (partition, account IDs). This is used to locate the exact S3Backend
-        # holding the bucket and to maintain the common bucket namespace.
-        self.bucket_accounts: dict[str, tuple[str, str]] = {}
+        # Maps bucket names to (partition, account IDs) for the current scope.
+        # S3 bucket names share one namespace per account/partition, but the
+        # namespace must be independent between caller scopes, so identical
+        # bucket names can coexist in different scopes.
+        self._bucket_accounts_by_scope: dict[
+            str | None, dict[str, tuple[str, str]]
+        ] = {None: {}}
+
+    @property
+    def bucket_accounts(self) -> dict[str, tuple[str, str]]:
+        key = self._partition_key()
+        bucket_accounts = self._bucket_accounts_by_scope.get(key)
+        if bucket_accounts is None:
+            with backend_lock:
+                bucket_accounts = self._bucket_accounts_by_scope.get(key)
+                if bucket_accounts is None:
+                    bucket_accounts = {}
+                    self._bucket_accounts_by_scope[key] = bucket_accounts
+        return bucket_accounts
+
+    def _reset_aux_partitions(self) -> None:
+        self._bucket_accounts_by_scope = {None: {}}
+
+    def _discard_aux_partition(self, partition_uid: str) -> None:
+        self._bucket_accounts_by_scope.pop(partition_uid, None)
 
 
 s3_backends = S3BackendDict(

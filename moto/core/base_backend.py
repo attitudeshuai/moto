@@ -296,8 +296,14 @@ class BackendDict(dict[str, AccountSpecificBackend[SERVICE_BACKEND]]):
     """
     Data Structure to store everything related to a specific service.
     Format:
-      [account_id: str]: AccountSpecificBackend
-      [account_id: str][region: str] = BaseBackend
+      [scope partition][account_id: str]: AccountSpecificBackend
+      [scope partition][account_id: str][region: str] = BaseBackend
+
+    The scope partition is derived from the scope bound to the current
+    request (see moto.core.scopes). Requests without a scope use the ``None``
+    partition, which is the legacy process-wide view. Each caller scope gets
+    its own set of account/region backends, so resource views are fully
+    isolated between scopes.
     """
 
     # We keep track of the BackendDict's that were:
@@ -305,22 +311,49 @@ class BackendDict(dict[str, AccountSpecificBackend[SERVICE_BACKEND]]):
     # - contain at least one AccountSpecificBackend
     #
     # In other words, this is the list of backends which are in use by the user
-    #   making it trivial to determine which backends to reset when the mocks end
+    # #   making it trivial to determine which backends to reset when the mocks end
     _instances: list["BackendDict[SERVICE_BACKEND]"] = []
 
     @classmethod
     def reset(cls) -> None:
         with backend_lock:
             for backend in BackendDict._instances:  # type: ignore[misc]
-                for account_specific_backend in backend.values():
-                    account_specific_backend.reset()
-                    # account_specific_backend.__getitem__.cache_clear()
-                backend.clear()
+                for partition in backend._partitions.values():
+                    for account_specific_backend in partition.values():
+                        account_specific_backend.reset()
+                    partition.clear()
+                # Restore the single, empty legacy partition.
+                backend._partitions = {None: {}}
+                backend._reset_aux_partitions()
             # https://github.com/getmoto/moto/issues/6592
             # Could be fixed by removing the cache, forcing all data to be regenerated every reset
             # But this also incurs a significant performance hit
             # backend.__getitem__.cache_clear()
             BackendDict._instances.clear()  # type: ignore[misc]
+
+    @classmethod
+    def reset_partition(cls, partition_uid: str) -> None:
+        """
+        Remove all data belonging to one caller scope across every service.
+
+        The ``None`` (legacy) partition cannot be removed this way - use
+        :meth:`reset` for the process-wide reset.
+        """
+        if partition_uid is None:
+            return
+        with backend_lock:
+            for backend in list(BackendDict._instances):  # type: ignore[misc]
+                partition = backend._partitions.pop(partition_uid, None)
+                if partition is not None:
+                    for account_specific_backend in partition.values():
+                        account_specific_backend.reset()
+                backend._discard_aux_partition(partition_uid)
+
+    def _reset_aux_partitions(self) -> None:
+        """Hook: reset auxiliary per-scope state kept outside _partitions."""
+
+    def _discard_aux_partition(self, partition_uid: str) -> None:
+        """Hook: drop auxiliary per-scope state for one released scope."""
 
     def __init__(
         self,
@@ -334,6 +367,30 @@ class BackendDict(dict[str, AccountSpecificBackend[SERVICE_BACKEND]]):
         self._use_boto3_regions = use_boto3_regions
         self._additional_regions = additional_regions
         self._id = str(uuid4())
+        # partition key (None = legacy default) -> {account_id: AccountSpecificBackend}
+        self._partitions: dict[
+            str | None, dict[str, AccountSpecificBackend[SERVICE_BACKEND]]
+        ] = {None: {}}
+
+    def _partition_key(self) -> str | None:
+        from .scopes import current_partition_uid
+
+        return current_partition_uid()
+
+    def _current_partition(self) -> dict[str, AccountSpecificBackend[SERVICE_BACKEND]]:
+        """
+        Return the account->backend map for the scope of the current request.
+        A fresh, empty map is created lazily for new scopes.
+        """
+        key = self._partition_key()
+        partition = self._partitions.get(key)
+        if partition is None:
+            with backend_lock:
+                partition = self._partitions.get(key)
+                if partition is None:
+                    partition = {}
+                    self._partitions[key] = partition
+        return partition
 
     def __hash__(self) -> int:  # type: ignore[override]
         # Required for the LRUcache to work.
@@ -348,28 +405,56 @@ class BackendDict(dict[str, AccountSpecificBackend[SERVICE_BACKEND]]):
 
     def __getitem__(self, account_id: str) -> AccountSpecificBackend[SERVICE_BACKEND]:
         self._create_account_specific_backend(account_id)
-        return super().__getitem__(account_id)
+        return self._current_partition()[account_id]
 
     def __delitem__(self, key: str) -> None:
-        super().__delitem__(key)
+        del self._current_partition()[key]
 
     def __iter__(self) -> Iterator[str]:
-        return super().__iter__()
+        return iter(self._current_partition())
 
     def __len__(self) -> int:
-        return super().__len__()
+        return len(self._current_partition())
+
+    def __contains__(self, account_id: object) -> bool:  # type: ignore[override]
+        return account_id in self._current_partition()
 
     def __setitem__(
         self,
         key: str,
         value: AccountSpecificBackend[SERVICE_BACKEND],
     ) -> None:
-        super().__setitem__(key, value)
+        self._current_partition()[key] = value
+
+    def get(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
+        return self._current_partition().get(key, default)
+
+    def keys(self) -> Any:  # type: ignore[override]
+        return self._current_partition().keys()
+
+    def values(self) -> Any:  # type: ignore[override]
+        return self._current_partition().values()
+
+    def items(self) -> Any:  # type: ignore[override]
+        return self._current_partition().items()
+
+    def clear(self) -> None:  # type: ignore[override]
+        self._current_partition().clear()
+
+    def pop(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
+        return self._current_partition().pop(key, default)
+
+    def setdefault(self, key: str, default: Any = None) -> Any:  # type: ignore[override]
+        return self._current_partition().setdefault(key, default)
+
+    def update(self, *args: Any, **kwargs: Any) -> None:  # type: ignore[override]
+        self._current_partition().update(*args, **kwargs)
 
     def _create_account_specific_backend(self, account_id: str) -> None:
         with backend_lock:
-            if account_id not in list(self.keys()):
-                self[account_id] = AccountSpecificBackend(
+            partition = self._current_partition()
+            if account_id not in partition:
+                partition[account_id] = AccountSpecificBackend(
                     service_name=self.service_name,
                     account_id=account_id,
                     backend=self.backend,
@@ -381,9 +466,9 @@ class BackendDict(dict[str, AccountSpecificBackend[SERVICE_BACKEND]]):
 
     def iter_backends(self) -> Iterator[tuple[str, str, BaseBackend]]:
         """
-        Iterate over a flattened view of all base backends in a BackendDict.
+        Iterate over a flattened view of all base backends in the current scope.
         Each record is a tuple of account id, region name, and the base backend within that account and region.
         """
-        for account_id, account_specific_backend in self.items():
+        for account_id, account_specific_backend in self._current_partition().items():
             for region_name, backend in account_specific_backend.items():
                 yield account_id, region_name, backend

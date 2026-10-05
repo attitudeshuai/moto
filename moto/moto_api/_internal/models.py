@@ -16,6 +16,10 @@ class MotoAPIBackend(BaseBackend):
         region_name = self.region_name
         account_id = self.account_id
 
+        from moto.core.scopes import scope_registry
+
+        # Release every caller scope first, then wipe all backend partitions.
+        scope_registry.reset()
         BackendDict.reset()
         reset_model_data()
         self.__init__(region_name, account_id)  # type: ignore[misc]

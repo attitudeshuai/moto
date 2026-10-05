@@ -1,5 +1,7 @@
 import json
+import re
 from typing import Any
+from urllib.parse import urlparse
 
 from botocore.awsrequest import AWSPreparedRequest
 
@@ -7,6 +9,15 @@ from moto import settings
 from moto.core import DEFAULT_ACCOUNT_ID
 from moto.core.common_types import TYPE_RESPONSE
 from moto.core.responses import ActionAuthenticatorMixin, BaseResponse
+from moto.core.scopes import scope_registry
+
+_SCOPE_PATH_REGEX = re.compile(r"/moto-api/scopes/(?P<scope_id>[^/]+)/?$")
+
+
+def _json_response(
+    status: int, payload: dict[str, Any]
+) -> TYPE_RESPONSE:
+    return status, {"Content-Type": "application/json"}, json.dumps(payload)
 
 
 class MotoAPIResponse(BaseResponse):
@@ -404,6 +415,75 @@ class MotoAPIResponse(BaseResponse):
 
         config = moto_api_backend.get_config()
         return 201, res_headers, json.dumps(config).encode("utf-8")
+
+    def list_scopes(
+        self,
+        request: Any,
+        full_url: str,
+        headers: Any,
+    ) -> TYPE_RESPONSE:
+        """List all live caller scopes."""
+        if request.method != "GET":
+            return _json_response(
+                400, {"__type": "InvalidRequest", "message": "Use GET to list scopes"}
+            )
+        return _json_response(200, {"scopes": scope_registry.list_scope_ids()})
+
+    def manage_scope(
+        self,
+        request: Any,
+        full_url: str,
+        headers: Any,
+    ) -> TYPE_RESPONSE:
+        """Create, inspect or release a caller scope.
+
+        PUT    /moto-api/scopes/<id>  -> create (idempotent; 201 created / 200 existing)
+        GET    /moto-api/scopes/<id>  -> inspect (200 / 404)
+        DELETE /moto-api/scopes/<id>  -> release scope and all its resources (200 / 404)
+        """
+        path = urlparse(full_url).path
+        match = _SCOPE_PATH_REGEX.search(path)
+        if match is None:
+            return _json_response(
+                400, {"__type": "InvalidRequest", "message": "Missing scope id"}
+            )
+        scope_id = match.group("scope_id")
+
+        if request.method == "PUT":
+            from moto.core.scopes import InvalidScopeIdError
+
+            try:
+                created = scope_registry.create(scope_id)
+            except InvalidScopeIdError as err:
+                return err.to_response()
+            return _json_response(
+                201 if created else 200,
+                {
+                    "status": "created" if created else "exists",
+                    "scope_id": scope_id,
+                },
+            )
+        if request.method == "GET":
+            if not scope_registry.exists(scope_id):
+                from moto.core.scopes import ScopeNotFoundError
+
+                return ScopeNotFoundError(scope_id).to_response()
+            return _json_response(200, {"status": "active", "scope_id": scope_id})
+        if request.method == "DELETE":
+            if not scope_registry.close(scope_id):
+                from moto.core.scopes import ScopeNotFoundError
+
+                return ScopeNotFoundError(scope_id).to_response()
+            return _json_response(
+                200, {"status": "released", "scope_id": scope_id}
+            )
+        return _json_response(
+            400,
+            {
+                "__type": "InvalidRequest",
+                "message": f"Unsupported method {request.method} for scope management",
+            },
+        )
 
     def _get_body(self, headers: Any, request: Any) -> Any:
         if isinstance(request, AWSPreparedRequest):

@@ -12,6 +12,8 @@ url_paths = {
     "{0}/moto-api/data.json": response_instance.model_data,
     "{0}/moto-api/reset": response_instance.reset_response,
     "{0}/moto-api/reset-auth": response_instance.reset_auth_response,
+    "{0}/moto-api/scopes$": response_instance.list_scopes,
+    "{0}/moto-api/scopes/(?P<scope_id>[^/]+)$": response_instance.manage_scope,
     "{0}/moto-api/seed": response_instance.seed,
     "{0}/moto-api/proxy/passthrough": response_instance.set_proxy_passthrough,
     "{0}/moto-api/config": response_instance.config,

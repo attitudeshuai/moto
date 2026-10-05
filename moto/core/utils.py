@@ -18,6 +18,7 @@ from ..settings import get_s3_custom_endpoints
 from .common_types import TYPE_RESPONSE
 from .constants import MISSING
 from .loaders import create_loader
+from .scopes import run_with_scope
 from .versions import PYTHON_311
 
 
@@ -121,7 +122,15 @@ class convert_to_flask_response:
 
         try:
             recorder._record_request(request)
-            result = self.callback(request, request.url, dict(request.headers))
+            # Bind the caller scope for the whole service dispatch, covering
+            # custom entry points like S3's bucket/key dispatchers as well.
+            result = run_with_scope(
+                request.headers,
+                self.callback,
+                request,
+                request.url,
+                dict(request.headers),
+            )
         except ClientError as exc:
             result = 400, {}, exc.response["Error"]["Message"]
         # result is a status, headers, response tuple
