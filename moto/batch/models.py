@@ -539,6 +539,8 @@ class Job(threading.Thread, BaseModel, DockerModel, ManagedState):
             self,
             "batch::job",
             JobStatus.status_transitions(),
+            failure_status=JobStatus.FAILED.value,
+            failure_reason_attr="job_stopped_reason",
         )
 
         self.job_name = name

@@ -845,6 +845,7 @@ class FakeReplicationInstance(ManagedState):
             self,
             model_name="dms::replicationinstance",
             transitions=[("creating", "available")],
+            failure_status="failed",
         )
 
         self.id = replication_instance_identifier
@@ -992,19 +993,22 @@ class FakeConnection(ManagedState):
             self,
             model_name="dms::connection",
             transitions=[("testing", "successful")],
+            failure_status="failed",
+            failure_reason_attr="last_failure_message",
         )
 
         self.replication_instance_arn = replication_instance_arn
         self.endpoint_arn = endpoint_arn
         self.replication_instance_identifier = replication_instance_identifier
         self.endpoint_identifier = endpoint_identifier
+        self.last_failure_message = ""
 
     def to_dict(self) -> dict[str, Any]:
         return {
             "ReplicationInstanceArn": self.replication_instance_arn,
             "EndpointArn": self.endpoint_arn,
             "Status": self.status,
-            "LastFailureMessage": "",
+            "LastFailureMessage": self.last_failure_message,
             "EndpointIdentifier": self.endpoint_identifier,
             "ReplicationInstanceIdentifier": self.replication_instance_identifier,
         }

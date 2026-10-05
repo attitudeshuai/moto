@@ -84,6 +84,11 @@ class AthenaResponse(BaseResponse):
                     "State": execution.status,
                     "SubmissionDateTime": execution.start_time,
                     "CompletionDateTime": execution.end_time,
+                    **(
+                        {"StateChangeReason": execution.state_change_reason}
+                        if execution.state_change_reason
+                        else {}
+                    ),
                 },
                 "Statistics": {
                     "EngineExecutionTimeInMillis": 0,

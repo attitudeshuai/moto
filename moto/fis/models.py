@@ -140,6 +140,7 @@ class Experiment(ManagedState, BaseModel):
                 ("running", "completed"),
                 ("stopping", "stopped"),
             ],
+            failure_status="failed",
         )
         self.account_id = account_id
         self.region_name = region_name

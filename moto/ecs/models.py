@@ -333,6 +333,8 @@ class Task(ManagedState, BaseModel):
                 # STOPPED state, but it is already in DELETED state.
                 # ("STOPPED", "DELETED"),
             ],
+            failure_status="STOPPED",
+            failure_reason_attr="stopped_reason",
         )
         self.id = str(mock_random.uuid4())
         self.cluster_name = cluster.name

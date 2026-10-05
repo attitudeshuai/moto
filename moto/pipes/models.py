@@ -64,7 +64,15 @@ class Pipe(BaseModel, ManagedState):
         kms_key_identifier: str | None = None,
     ):
         ManagedState.__init__(
-            self, "pipes::pipe", transitions=PipeStatus.status_transitions()
+            self,
+            "pipes::pipe",
+            transitions=PipeStatus.status_transitions(),
+            failure_status={
+                "CREATING": "CREATE_FAILED",
+                "UPDATING": "UPDATE_FAILED",
+                "DELETING": "DELETE_FAILED",
+            },
+            failure_reason_attr="state_reason",
         )
 
         self.name = name

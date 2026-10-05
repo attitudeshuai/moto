@@ -238,7 +238,7 @@ class FakeKey(BaseModel, ManagedState):
         return new_status
 
     @status.setter
-    def status(self, value: str) -> None:
+    def status(self, value: str | None) -> None:
         self._status = value
 
     def set_metadata(self, metadata: Any, replace: bool = False) -> None:
@@ -384,6 +384,7 @@ class FakeKey(BaseModel, ManagedState):
             state["value"] = ""
         del state["_value_buffer"]
         del state["lock"]
+        state.pop("_lock", None)
         return state
 
     def __setstate__(self, state: dict[str, Any]) -> None:
@@ -394,6 +395,7 @@ class FakeKey(BaseModel, ManagedState):
         )
         self.value = state["value"]  # type: ignore
         self.lock = threading.Lock()
+        self._lock = threading.RLock()
 
     def is_locked(self, governance_bypass: bool) -> bool:
         if self.lock_legal_status == "ON":

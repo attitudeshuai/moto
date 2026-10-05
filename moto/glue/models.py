@@ -2300,6 +2300,7 @@ class FakeJobRun(ManagedState):
             self,
             model_name="glue::job_run",
             transitions=[("STARTING", "RUNNING"), ("RUNNING", "SUCCEEDED")],
+            failure_status="FAILED",
         )
         self.job_name = job_name
         self.job_run_id = f"jr_{mock_random.get_random_hex(64)}"

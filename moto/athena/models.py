@@ -124,6 +124,8 @@ class Execution(ManagedState):
             self,
             model_name="athena::execution",
             transitions=[("QUEUED", "RUNNING"), ("RUNNING", "SUCCEEDED")],
+            failure_status="FAILED",
+            failure_reason_attr="state_change_reason",
         )
         self.id = str(mock_random.uuid4())
         self.query = query
@@ -133,6 +135,7 @@ class Execution(ManagedState):
         self.execution_parameters = execution_parameters
         self.start_time = time.time()
         self.end_time = time.time()
+        self.state_change_reason: str | None = None
 
         if self.config is not None and "OutputLocation" in self.config:
             if not self.config["OutputLocation"].endswith("/"):

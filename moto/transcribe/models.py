@@ -62,6 +62,8 @@ class FakeTranscriptionJob(BaseObject, ManagedState):
                 ("QUEUED", "IN_PROGRESS"),
                 ("IN_PROGRESS", "COMPLETED"),
             ],
+            failure_status="FAILED",
+            failure_reason_attr="failure_reason",
         )
         self._account_id = account_id
         self._region_name = region_name
@@ -123,6 +125,7 @@ class FakeTranscriptionJob(BaseObject, ManagedState):
             "GET": [
                 "TranscriptionJobName",
                 "TranscriptionJobStatus",
+                "FailureReason",
                 "LanguageCode",
                 "LanguageCodes",
                 "MediaSampleRateHertz",
@@ -261,6 +264,8 @@ class FakeVocabulary(BaseObject, ManagedState):
         super().__init__(
             "transcribe::vocabulary",
             transitions=[(None, "PENDING"), ("PENDING", "READY")],
+            failure_status="FAILED",
+            failure_reason_attr="failure_reason",
         )
         # Configure internal properties
         self._region_name = region_name
@@ -337,6 +342,8 @@ class FakeMedicalTranscriptionJob(BaseObject, ManagedState):
                 ("QUEUED", "IN_PROGRESS"),
                 ("IN_PROGRESS", "COMPLETED"),
             ],
+            failure_status="FAILED",
+            failure_reason_attr="failure_reason",
         )
         self._region_name = region_name
         self.medical_transcription_job_name = medical_transcription_job_name
@@ -375,6 +382,7 @@ class FakeMedicalTranscriptionJob(BaseObject, ManagedState):
             "GET": [
                 "MedicalTranscriptionJobName",
                 "TranscriptionJobStatus",
+                "FailureReason",
                 "LanguageCode",
                 "MediaSampleRateHertz",
                 "MediaFormat",

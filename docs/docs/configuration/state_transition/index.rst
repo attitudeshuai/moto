@@ -98,6 +98,87 @@ To show how this would work in practice, let's look at an example test:
 This should be done cleanly in a while-loop of-course, similar to the `create_and_wait_for_cluster` defined above - but this is a good way to showcase the behaviour.
 
 
+Orchestrating state transitions
+################################
+
+The three progression modes above only allow indirect control over the progression of a resource - via descriptions or elapsed time. Sometimes more control is needed: progressing one specific resource directly to a specific stage, progressing a group of resources in a specific order, or verifying that the application handles a failure halfway through the lifecycle.
+
+Every resource that supports state transitions therefore exposes an in-memory orchestration API on the model itself. These features are opt-in - when they are not used, the behaviour is exactly the same as described above.
+
+Progress directly to a target stage
+**************************************
+
+Use ``advance_to`` to progress a resource directly to any of its stages, taking every transition in between in a single call, regardless of the configured progression mode:
+
+.. sourcecode:: python
+
+    from moto.dax.models import dax_backends
+
+    cluster = dax_backends["123456789012"]["us-east-1"].clusters["my_new_cluster"]
+    cluster.advance_to("creating")   # no-op, it is already creating
+    cluster.advance_to("available")  # jumps directly to 'available'
+
+Pass ``None`` to progress the resource all the way to its final stage.
+
+Inject a failure
+******************
+
+Use ``fail_at`` to inject a failure at a specific stage. When the resource reaches that stage (through any trigger), it is moved to the failure status of that service, the failure reason is written to the existing failure-reason field of the service, and the resource freezes - it will no longer progress automatically, even after more descriptions.
+
+.. sourcecode:: python
+
+    from moto.pipes.models import pipes_backends
+
+    pipe = pipes_backends["123456789012"]["eu-west-1"].pipes["my-pipe"]
+    pipe.fail_at("CREATING", reason="The execution role could not be assumed")
+
+    # boto3: describe_pipe now returns CurrentState='CREATE_FAILED' and
+    # StateReason='The execution role could not be assumed'
+
+The injected failure reuses the failure status and reason fields that the service already has (for example ``FAILED``/``FailureReason`` for Transcribe, ``CREATE_FAILED``/``StateReason`` for EventBridge Pipes, or ``failed``/``LastFailureMessage`` for DMS), so the failure-handling branches of the code under test run for real. ``failure_status`` can be passed to override the failure status explicitly.
+
+Use ``clear_failure`` to remove the (armed or applied) failure and resume automatic progression.
+
+Progress a group of resources in dependency order
+***************************************************
+
+:class:`~moto.moto_api.OrchestrationPlan` allows a group of resources to be progressed together. Every resource is only progressed once all of its dependencies have reached their target:
+
+.. sourcecode:: python
+
+    from moto.moto_api import OrchestrationPlan
+
+    plan = OrchestrationPlan()
+    plan.add(vpc, target="available")
+    plan.add(instance, target="available", depends_on=[vpc])
+    plan.add(load_balancer, target="active", depends_on=[instance])
+    plan.execute()
+
+For resources that simply have to progress one after another, use the ``chain`` helper:
+
+.. sourcecode:: python
+
+    OrchestrationPlan.chain([first, second, third], target="available").execute()
+
+If a resource fails (a failure was injected) or can not reach its target, its dependent resources are not progressed and an ``OrchestrationError`` is raised. The statuses reached so far remain available on the exception.
+
+Observability
+**************
+
+The progression of every resource can be inspected:
+
+.. sourcecode:: python
+
+    cluster.status               # current stage, e.g. 'available'
+    cluster.remaining_statuses   # stages still ahead, e.g. ['deleting', 'deleted']
+    cluster.last_trigger         # what caused the last progression:
+                                 # 'immediate', 'manual', 'time' or 'orchestration'
+    cluster.failure              # {'stage', 'status', 'reason', 'trigger'} or None
+    cluster.orchestration_state()  # all of the above in a single snapshot
+
+Progression is thread-safe: concurrent reads of the same resource advance every stage exactly once, and the observed status only ever moves forward. The orchestration state is kept in memory on the resource itself - it is never persisted, and it does not replace the events or state-change history produced by the individual services.
+
+
 Registered models
 ########################
 

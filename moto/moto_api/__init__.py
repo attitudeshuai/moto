@@ -6,6 +6,19 @@ Use this manager to configure how AWS models transition between states. (initial
 """
 state_manager = _internal.state_manager.StateManager()
 
+# Imported after the state_manager is created, as the orchestration modules
+# depend on it.
+from moto.moto_api._internal import (  # noqa: E402
+    managed_state_model as _managed_state_model,
+)
+from moto.moto_api._internal import (  # noqa: E402
+    orchestration as _orchestration,
+)
+
+ManagedState = _managed_state_model.ManagedState
+OrchestrationError = _managed_state_model.OrchestrationError
+OrchestrationPlan = _orchestration.OrchestrationPlan
+
 """
 Default transitions across Moto
 """
