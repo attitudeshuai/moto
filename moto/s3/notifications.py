@@ -1,12 +1,16 @@
 import copy
 import json
+from collections.abc import Callable
 from enum import Enum
 from typing import TYPE_CHECKING, Any
 from urllib.parse import quote_plus
 
 from moto.core.utils import iso_8601_datetime_with_milliseconds, unix_time
 
+from .delivery import DeliveryManager
+
 if TYPE_CHECKING:
+    from moto.events.utils import EventMessageType
     from moto.s3.models import FakeBucket
 
 
@@ -99,17 +103,105 @@ def _get_region_from_arn(arn: str) -> str:
     return arn.split(":")[3]
 
 
+def _get_delivery_manager(bucket: "FakeBucket") -> DeliveryManager | None:
+    # Lazy import to avoid the circular import s3.models <-> s3.notifications.
+    # S3 backends are partition scoped, not region scoped.
+    try:
+        from moto.s3.models import s3_backends
+
+        return s3_backends[bucket.account_id][bucket.partition].delivery_manager
+    except Exception:  # noqa: BLE001 - never break an object operation
+        return None
+
+
+def _source_detail(bucket: "FakeBucket", event_name: Any, key: Any) -> dict[str, Any]:
+    return {
+        "service": "s3",
+        "bucket": bucket.name,
+        "region": bucket.region_name,
+        "event": getattr(event_name, "value", event_name),
+        "key": key.name,
+    }
+
+
 def send_event(
     account_id: str, event_name: S3NotificationEvent, bucket: Any, key: Any
 ) -> None:
     if bucket.notification_configuration is None:
         return
 
+    manager = _get_delivery_manager(bucket)
+    if manager is None:
+        # No backend attached (e.g. standalone use) - fall back to the
+        # legacy fire-and-forget behaviour.
+        _send_event_legacy(account_id, event_name, bucket, key)
+        return
+
+    source_arn = bucket.arn
+    source_detail = _source_detail(bucket, event_name, key)
+
+    for notification in bucket.notification_configuration.cloud_function:
+        if not notification.matches(event_name, key.name):
+            continue
+        event_body = _get_s3_event(event_name, bucket, key, notification.id)
+        region_name = _get_region_from_arn(notification.arn)
+        manager.submit(
+            source_arn=source_arn,
+            source_detail=source_detail,
+            target_arn=notification.arn,
+            target_type="lambda",
+            payload=event_body,
+            configuration_id=notification.id,
+            attempt=_lambda_attempt(
+                account_id, event_body, notification.arn, region_name
+            ),
+        )
+
+    for notification in bucket.notification_configuration.queue:
+        if not notification.matches(event_name, key.name):
+            continue
+        event_body = _get_s3_event(event_name, bucket, key, notification.id)
+        region_name = _get_region_from_arn(notification.arn)
+        queue_name = notification.arn.split(":")[-1]
+        manager.submit(
+            source_arn=source_arn,
+            source_detail=source_detail,
+            target_arn=notification.arn,
+            target_type="sqs",
+            payload=event_body,
+            configuration_id=notification.id,
+            native_dlq_arn=_native_sqs_dead_letter_arn(
+                account_id, region_name, queue_name
+            ),
+            attempt=_sqs_attempt(account_id, event_body, queue_name, region_name),
+        )
+
+    for notification in bucket.notification_configuration.topic:
+        if not notification.matches(event_name, key.name):
+            continue
+        event_body = _get_s3_event(event_name, bucket, key, notification.id)
+        region_name = _get_region_from_arn(notification.arn)
+        manager.submit(
+            source_arn=source_arn,
+            source_detail=source_detail,
+            target_arn=notification.arn,
+            target_type="sns",
+            payload=event_body,
+            configuration_id=notification.id,
+            attempt=_sns_attempt(account_id, event_body, notification.arn, region_name),
+        )
+
+    if bucket.notification_configuration.event_bridge is not None:
+        _send_event_bridge_via_manager(manager, account_id, bucket, event_name, key)
+
+
+def _send_event_legacy(
+    account_id: str, event_name: S3NotificationEvent, bucket: Any, key: Any
+) -> None:
     for notification in bucket.notification_configuration.cloud_function:
         if notification.matches(event_name, key.name):
             event_body = _get_s3_event(event_name, bucket, key, notification.id)
             region_name = _get_region_from_arn(notification.arn)
-
             _invoke_awslambda(account_id, event_body, notification.arn, region_name)
 
     for notification in bucket.notification_configuration.queue:
@@ -117,31 +209,132 @@ def send_event(
             event_body = _get_s3_event(event_name, bucket, key, notification.id)
             region_name = _get_region_from_arn(notification.arn)
             queue_name = notification.arn.split(":")[-1]
-
             _send_sqs_message(account_id, event_body, queue_name, region_name)
 
     for notification in bucket.notification_configuration.topic:
         if notification.matches(event_name, key.name):
             event_body = _get_s3_event(event_name, bucket, key, notification.id)
             region_name = _get_region_from_arn(notification.arn)
-            topic_arn = notification.arn
-
-            _send_sns_message(account_id, event_body, topic_arn, region_name)
+            _send_sns_message(account_id, event_body, notification.arn, region_name)
 
     if bucket.notification_configuration.event_bridge is not None:
         _send_event_bridge_message(account_id, bucket, event_name, key)
 
 
-def _send_sqs_message(
+# ---------------------------------------------------------------------------
+# Attempt factories. Each returns a zero-argument callable that raises on
+# failure. The delivery manager records the result and handles retries/DLQ.
+# ---------------------------------------------------------------------------
+def _sqs_attempt(
     account_id: str, event_body: Any, queue_name: str, region_name: str
-) -> None:
-    try:
+) -> Callable[[], None]:
+    def attempt() -> None:
         from moto.sqs.models import sqs_backends
 
         sqs_backend = sqs_backends[account_id][region_name]
         sqs_backend.send_message(
             queue_name=queue_name, message_body=json.dumps(event_body)
         )
+
+    return attempt
+
+
+def _sns_attempt(
+    account_id: str, event_body: Any, topic_arn: str, region_name: str
+) -> Callable[[], None]:
+    def attempt() -> None:
+        from moto.sns.models import sns_backends
+
+        sns_backend = sns_backends[account_id][region_name]
+        sns_backend.publish(arn=topic_arn, message=json.dumps(event_body))
+
+    return attempt
+
+
+def _lambda_attempt(
+    account_id: str, event_body: Any, fn_arn: str, region_name: str
+) -> Callable[[], None]:
+    def attempt() -> None:
+        from moto.awslambda.utils import get_backend
+
+        lambda_backend = get_backend(account_id, region_name)
+        func = lambda_backend.get_function(fn_arn)
+        func.invoke(json.dumps(event_body), {}, {})
+
+    return attempt
+
+
+def _native_sqs_dead_letter_arn(
+    account_id: str, region_name: str, queue_name: str
+) -> str | None:
+    """The DLQ a queue itself registered via its redrive policy, if any."""
+    try:
+        from moto.sqs.models import sqs_backends
+
+        queue = sqs_backends[account_id][region_name].queues.get(queue_name)
+        if queue is not None and queue.redrive_policy is not None:
+            return queue.redrive_policy.get("deadLetterTargetArn")
+    except Exception:  # noqa: BLE001 - best effort lookup only
+        return None
+    return None
+
+
+def _send_event_bridge_via_manager(
+    manager: DeliveryManager,
+    account_id: str,
+    bucket: "FakeBucket",
+    event_name: str,
+    key: Any,
+) -> None:
+    try:
+        event = _build_eventbridge_event(account_id, bucket, event_name, key)
+    except Exception:  # noqa: BLE001 - unsupported events are dropped, as before
+        return
+
+    try:
+        from moto.events.models import events_backends
+
+        events_backend = events_backends[account_id][bucket.region_name]
+        buses = list(events_backend.event_buses.values())
+    except Exception:  # noqa: BLE001 - EventBridge not available behaves as no-op
+        return
+
+    for event_bus in buses:
+        for rule in list(event_bus.rules.values()):
+            try:
+                if not rule.event_pattern.matches_event(event):
+                    continue
+            except Exception:  # noqa: BLE001 - a broken rule never breaks others
+                continue
+            for target in list(rule.targets):
+                target_arn = target.get("Arn", "")
+                native_dlq_arn = (target.get("DeadLetterConfig") or {}).get("Arn")
+                manager.submit(
+                    source_arn=bucket.arn,
+                    source_detail=_source_detail(bucket, event_name, key),
+                    target_arn=target_arn,
+                    target_type="eventbridge",
+                    payload=event,
+                    configuration_id=rule.name,
+                    native_dlq_arn=native_dlq_arn,
+                    attempt=_eventbridge_target_attempt(rule, target, event),
+                )
+
+
+def _eventbridge_target_attempt(
+    rule: Any, target: dict[str, Any], event: "EventMessageType"
+) -> Callable[[], None]:
+    def attempt() -> None:
+        rule.send_to_target(target, event, transform_input=False)
+
+    return attempt
+
+
+def _send_sqs_message(
+    account_id: str, event_body: Any, queue_name: str, region_name: str
+) -> None:
+    try:
+        _sqs_attempt(account_id, event_body, queue_name, region_name)()
     except:  # noqa
         # This is an async action in AWS.
         # Even if this part fails, the calling function should pass, so catch all errors
@@ -154,16 +347,47 @@ def _send_sns_message(
     account_id: str, event_body: Any, topic_arn: str, region_name: str
 ) -> None:
     try:
-        from moto.sns.models import sns_backends
-
-        sns_backend = sns_backends[account_id][region_name]
-        sns_backend.publish(arn=topic_arn, message=json.dumps(event_body))
+        _sns_attempt(account_id, event_body, topic_arn, region_name)()
     except:  # noqa
         # This is an async action in AWS.
         # Even if this part fails, the calling function should pass, so catch all errors
         # Possible exceptions that could be thrown:
         # - Topic does not exist
         pass
+
+
+def _build_eventbridge_event(
+    account_id: str,
+    bucket: "FakeBucket",
+    event_name: str,
+    key: Any,
+) -> "EventMessageType":
+    from moto.events.utils import _BASE_EVENT_MESSAGE
+
+    event = copy.deepcopy(_BASE_EVENT_MESSAGE)
+    event["detail-type"] = _detail_type(event_name)
+    event["source"] = "aws.s3"
+    event["account"] = account_id
+    event["time"] = unix_time()
+    event["region"] = bucket.region_name
+    event["resources"] = [bucket.arn]
+    event["detail"] = {
+        "version": "0",
+        "bucket": {"name": bucket.name},
+        "object": {
+            "key": key.name,
+            "size": key.size,
+            "eTag": key.etag.replace('"', ""),
+            "version-id": key.version_id,
+            "sequencer": "617f08299329d189",
+        },
+        "request-id": "N4N7GDK58NMKJ12R",
+        "requester": "123456789012",
+        "source-ip-address": "1.2.3.4",
+        # ex) s3:ObjectCreated:Put -> ObjectCreated
+        "reason": event_name.split(":")[1],
+    }
+    return event
 
 
 def _send_event_bridge_message(
@@ -174,31 +398,8 @@ def _send_event_bridge_message(
 ) -> None:
     try:
         from moto.events.models import events_backends
-        from moto.events.utils import _BASE_EVENT_MESSAGE
 
-        event = copy.deepcopy(_BASE_EVENT_MESSAGE)
-        event["detail-type"] = _detail_type(event_name)
-        event["source"] = "aws.s3"
-        event["account"] = account_id
-        event["time"] = unix_time()
-        event["region"] = bucket.region_name
-        event["resources"] = [bucket.arn]
-        event["detail"] = {
-            "version": "0",
-            "bucket": {"name": bucket.name},
-            "object": {
-                "key": key.name,
-                "size": key.size,
-                "eTag": key.etag.replace('"', ""),
-                "version-id": key.version_id,
-                "sequencer": "617f08299329d189",
-            },
-            "request-id": "N4N7GDK58NMKJ12R",
-            "requester": "123456789012",
-            "source-ip-address": "1.2.3.4",
-            # ex) s3:ObjectCreated:Put -> ObjectCreated
-            "reason": event_name.split(":")[1],
-        }
+        event = _build_eventbridge_event(account_id, bucket, event_name, key)
 
         events_backend = events_backends[account_id][bucket.region_name]
         for event_bus in events_backend.event_buses.values():
@@ -262,11 +463,7 @@ def _invoke_awslambda(
     account_id: str, event_body: Any, fn_arn: str, region_name: str
 ) -> None:
     try:
-        from moto.awslambda.utils import get_backend
-
-        lambda_backend = get_backend(account_id, region_name)
-        func = lambda_backend.get_function(fn_arn)
-        func.invoke(json.dumps(event_body), {}, {})
+        _lambda_attempt(account_id, event_body, fn_arn, region_name)()
     except:  # noqa
         # This is an async action in AWS.
         # Even if this part fails, the calling function should pass, so catch all errors

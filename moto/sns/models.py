@@ -615,6 +615,11 @@ class SNSBackend(BaseBackend, TaggableResourcesMixin):
             parsed_arn = parse_arn(arn)
             sns_backends[parsed_arn.account][parsed_arn.region].topics.pop(arn, None)
 
+        # Converge S3 notification deliveries still retrying to this topic.
+        from moto.s3.delivery import cancel_target
+
+        cancel_target(arn)
+
     def get_topic(self, arn: str) -> Topic:
         parsed_arn = parse_arn(arn)
         try:

@@ -132,10 +132,19 @@ class Rule(CloudFormationModel):
                 self.targets.append(target)
 
     def remove_targets(self, ids: list[str]) -> None:
+        removed_arns: list[str] = []
         for target_id in ids:
             index = self._check_target_exists(target_id)
             if index is not None:
-                self.targets.pop(index)
+                removed_arns.append(self.targets.pop(index).get("Arn", ""))
+
+        # Converge S3 notification deliveries still retrying to these targets.
+        if removed_arns:
+            from moto.s3.delivery import cancel_target
+
+            for target_arn in removed_arns:
+                if target_arn:
+                    cancel_target(target_arn)
 
     def send_to_targets(
         self, original_event: EventMessageType, transform_input: bool = True
@@ -149,57 +158,66 @@ class Rule(CloudFormationModel):
         # - SQS Queue + FIFO Queue
         # - Cross-region/account EventBus
         for target in self.targets:
-            arn = parse_arn(target["Arn"])
+            self.send_to_target(target, original_event, transform_input)
 
-            if transform_input:
-                input_transformer = target.get("InputTransformer", {})
-                event = EventTemplateParser.parse(
-                    input_template=input_transformer.get("InputTemplate"),
-                    input_paths_map=input_transformer.get("InputPathsMap", {}),
-                    event=original_event,
+    def send_to_target(
+        self,
+        target: dict[str, Any],
+        original_event: EventMessageType,
+        transform_input: bool = True,
+    ) -> None:
+        """Deliver one event to exactly one target of this rule."""
+        arn = parse_arn(target["Arn"])
+
+        if transform_input:
+            input_transformer = target.get("InputTransformer", {})
+            event = EventTemplateParser.parse(
+                input_template=input_transformer.get("InputTemplate"),
+                input_paths_map=input_transformer.get("InputPathsMap", {}),
+                event=original_event,
+            )
+        else:
+            event = original_event.copy()  # type: ignore[assignment]
+
+        if arn.service == "logs" and arn.resource_type == "log-group":
+            self._send_to_cw_log_group(arn.resource_id, event)
+        elif arn.service == "events" and not arn.resource_type:
+            archive_arn = parse_arn(event["archive-arn"])
+
+            self._send_to_events_archive(archive_arn.resource_id, original_event)
+        elif arn.service == "sqs":
+            group_id = target.get("SqsParameters", {}).get("MessageGroupId")
+            self._send_to_sqs_queue(arn.resource_id, event, group_id)
+        elif arn.service == "events" and arn.resource_type == "event-bus":
+            cross_account_backend: EventsBackend = events_backends[arn.account][
+                arn.region
+            ]
+            new_event = {
+                "Source": event["source"],
+                "DetailType": event["detail-type"],
+                "Detail": json.dumps(event["detail"]),
+                "EventBusName": arn.resource_id,
+            }
+            cross_account_backend.put_events([new_event])
+        elif arn.service == "events" and arn.resource_type == "api-destination":
+            if settings.events_invoke_http():
+                api_destination = self._find_api_destination(arn.resource_id)
+                request_parameters = target.get("HttpParameters", {})
+                headers = request_parameters.get("HeaderParameters", {})
+                qs_params = request_parameters.get("QueryStringParameters", {})
+                query_string = "&".join(
+                    [f"{key}={val}" for key, val in qs_params.items()]
                 )
-            else:
-                event = original_event.copy()  # type: ignore[assignment]
-
-            if arn.service == "logs" and arn.resource_type == "log-group":
-                self._send_to_cw_log_group(arn.resource_id, event)
-            elif arn.service == "events" and not arn.resource_type:
-                archive_arn = parse_arn(event["archive-arn"])
-
-                self._send_to_events_archive(archive_arn.resource_id, original_event)
-            elif arn.service == "sqs":
-                group_id = target.get("SqsParameters", {}).get("MessageGroupId")
-                self._send_to_sqs_queue(arn.resource_id, event, group_id)
-            elif arn.service == "events" and arn.resource_type == "event-bus":
-                cross_account_backend: EventsBackend = events_backends[arn.account][
-                    arn.region
-                ]
-                new_event = {
-                    "Source": event["source"],
-                    "DetailType": event["detail-type"],
-                    "Detail": json.dumps(event["detail"]),
-                    "EventBusName": arn.resource_id,
-                }
-                cross_account_backend.put_events([new_event])
-            elif arn.service == "events" and arn.resource_type == "api-destination":
-                if settings.events_invoke_http():
-                    api_destination = self._find_api_destination(arn.resource_id)
-                    request_parameters = target.get("HttpParameters", {})
-                    headers = request_parameters.get("HeaderParameters", {})
-                    qs_params = request_parameters.get("QueryStringParameters", {})
-                    query_string = "&".join(
-                        [f"{key}={val}" for key, val in qs_params.items()]
-                    )
-                    url = api_destination.invocation_endpoint + (
-                        f"?{query_string}" if query_string else ""
-                    )
-                    requests.request(
-                        method=api_destination.http_method,
-                        url=url,
-                        headers=headers,
-                    )
-            else:
-                raise NotImplementedError(f"Expr not defined for {type(self)}")
+                url = api_destination.invocation_endpoint + (
+                    f"?{query_string}" if query_string else ""
+                )
+                requests.request(
+                    method=api_destination.http_method,
+                    url=url,
+                    headers=headers,
+                )
+        else:
+            raise NotImplementedError(f"Expr not defined for {type(self)}")
 
     def _send_to_cw_log_group(self, name: str, event: dict[str, Any]) -> None:
         from moto.logs import logs_backends

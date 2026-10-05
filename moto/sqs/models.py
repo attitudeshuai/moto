@@ -753,9 +753,15 @@ class SQSBackend(BaseBackend, TaggableResourcesMixin):
         return queue
 
     def delete_queue(self, queue_name: str) -> None:
-        self.get_queue(queue_name)
+        queue = self.get_queue(queue_name)
+        queue_arn = queue.queue_arn
 
         del self.queues[queue_name]
+
+        # Converge S3 notification deliveries still retrying to this queue.
+        from moto.s3.delivery import cancel_target
+
+        cancel_target(queue_arn)
 
     def get_queue_attributes(
         self, queue_name: str, attribute_names: list[str]

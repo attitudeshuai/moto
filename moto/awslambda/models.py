@@ -2279,7 +2279,19 @@ class LambdaBackend(BaseBackend, TaggableResourcesMixin):
         return self._lambdas.get_arn(function_arn)
 
     def delete_function(self, function_name: str, qualifier: str | None = None) -> None:
+        function_arn = None
+        try:
+            function_arn = self.get_function(function_name, qualifier).function_arn
+        except Exception:  # noqa: BLE001 - deletion itself surfaces the error
+            pass
+
         self._lambdas.del_function(function_name, qualifier)
+
+        # Converge S3 notification deliveries still retrying to this function.
+        if function_arn is not None:
+            from moto.s3.delivery import cancel_target
+
+            cancel_target(function_arn)
 
     def list_functions(
         self, func_version: str | None = None

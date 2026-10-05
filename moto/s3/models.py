@@ -79,6 +79,15 @@ from ..settings import (
 )
 from . import notifications
 from .cloud_formation import cfn_to_api_encryption
+from .delivery import (
+    DeliveryManager,
+)
+from .delivery import (
+    cancel_source as cancel_delivery_source,
+)
+from .delivery import (
+    cancel_target as cancel_delivery_target,
+)
 from .select_object_content import parse_query
 from .utils import (
     ARCHIVE_STORAGE_CLASSES,
@@ -1444,8 +1453,13 @@ class FakeBucket(CloudFormationModel):
     def set_notification_configuration(
         self, notification_config: dict[str, Any] | None
     ) -> None:
+        old_target_arns = self._notification_target_arns()
+
         if not notification_config:
             self.notification_configuration = None
+            # Converge retries for every target that no longer exists.
+            for arn in old_target_arns:
+                cancel_delivery_target(arn)
             return
 
         self.notification_configuration = NotificationConfiguration(
@@ -1454,6 +1468,10 @@ class FakeBucket(CloudFormationModel):
             cloud_function=notification_config.get("CloudFunctionConfiguration"),
             event_bridge=notification_config.get("EventBridgeConfiguration"),
         )
+
+        # Converge retries for targets that disappeared from the configuration.
+        for arn in old_target_arns - self._notification_target_arns():
+            cancel_delivery_target(arn)
 
         # Validate that the region is correct:
         for thing in ["topic", "queue", "cloud_function"]:
@@ -1464,6 +1482,16 @@ class FakeBucket(CloudFormationModel):
 
         # Send test events so the user can verify these notifications were set correctly
         notifications.send_test_event(account_id=self.account_id, bucket=self)
+
+    def _notification_target_arns(self) -> set[str]:
+        if self.notification_configuration is None:
+            return set()
+        config = self.notification_configuration
+        return {
+            *(notification.arn for notification in config.topic),
+            *(notification.arn for notification in config.queue),
+            *(notification.arn for notification in config.cloud_function),
+        }
 
     def set_accelerate_configuration(self, accelerate_config: str) -> None:
         if self.accelerate_configuration is None and accelerate_config == "Suspended":
@@ -1807,6 +1835,10 @@ class S3Backend(BaseBackend, CloudWatchMetricProvider, TaggableResourcesMixin):
         self.tagger = TaggingService()
         self._pagination_tokens: dict[str, str] = {}
         self.inventory_configs: dict[str, FakeBucketInventoryConfiguration] = {}
+        # Reliable delivery pathway (retries/dead-lettering disabled by default)
+        self.delivery_manager = DeliveryManager(
+            region_name=region_name, account_id=account_id
+        )
 
     def reset(self) -> None:
         # For every key and multipart, Moto opens a TemporaryFile to write the value of those keys
@@ -1829,6 +1861,8 @@ class S3Backend(BaseBackend, CloudWatchMetricProvider, TaggableResourcesMixin):
             mp.dispose()
         for key in FakeKey.instances_tracked:  # type: ignore
             key.dispose()
+        # Stop any in-flight notification retries before the backend is rebuilt.
+        self.delivery_manager.shutdown()
         super().reset()
 
     def log_incoming_request(self, request: Any, bucket_name: str) -> None:
@@ -2037,6 +2071,8 @@ class S3Backend(BaseBackend, CloudWatchMetricProvider, TaggableResourcesMixin):
             # Can't delete a bucket with keys
             return None
         else:
+            # Converge any notification retries still in flight for this bucket.
+            cancel_delivery_source(bucket.arn)
             s3_backends.bucket_accounts.pop(bucket_name, None)
             return self.buckets.pop(bucket_name)
 
